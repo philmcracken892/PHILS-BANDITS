@@ -35,6 +35,241 @@ local function getSpawnLimits()
     }
 end
 
+-- Get retarget settings from config or use defaults
+local function getRetargetSettings()
+    return {
+        enabled = (Config.RetargetSettings and Config.RetargetSettings.enabled) ~= false,
+        retargetRange = (Config.RetargetSettings and Config.RetargetSettings.retargetRange) or 150.0,
+        retargetDelay = (Config.RetargetSettings and Config.RetargetSettings.retargetDelay) or 2000,
+        aggroAllPlayersInRange = (Config.RetargetSettings and Config.RetargetSettings.aggroAllPlayersInRange) or false,
+        checkInterval = (Config.RetargetSettings and Config.RetargetSettings.checkInterval) or 3000,
+    }
+end
+
+-- ============================================
+-- PLAYER TARGETING FUNCTIONS
+-- ============================================
+
+-- Get all players within range of a position
+function GetPlayersInRange(coords, range)
+    local players = {}
+    local allPlayers = GetActivePlayers()
+    
+    for _, playerId in ipairs(allPlayers) do
+        local playerPed = GetPlayerPed(playerId)
+        if playerPed and DoesEntityExist(playerPed) and not IsPedDeadOrDying(playerPed, true) then
+            local playerCoords = GetEntityCoords(playerPed)
+            local distance = GetDistanceBetweenCoords(coords.x, coords.y, coords.z, playerCoords.x, playerCoords.y, playerCoords.z, true)
+            if distance <= range then
+                table.insert(players, {
+                    id = playerId,
+                    ped = playerPed,
+                    distance = distance,
+                    coords = playerCoords
+                })
+            end
+        end
+    end
+    
+    -- Sort by distance (closest first)
+    table.sort(players, function(a, b)
+        return a.distance < b.distance
+    end)
+    
+    return players
+end
+
+-- Get the nearest alive player to a position
+function GetNearestAlivePlayer(coords, range)
+    local players = GetPlayersInRange(coords, range)
+    if #players > 0 then
+        return players[1].ped, players[1].distance
+    end
+    return nil, nil
+end
+
+-- Retarget a single entity to attack nearest player
+function RetargetEntity(entity, range)
+    if not DoesEntityExist(entity) or IsPedDeadOrDying(entity, true) then
+        return false
+    end
+    
+    local entityCoords = GetEntityCoords(entity)
+    local settings = getRetargetSettings()
+    local searchRange = range or settings.retargetRange
+    
+    if settings.aggroAllPlayersInRange then
+        -- Attack all players in range
+        local players = GetPlayersInRange(entityCoords, searchRange)
+        if #players > 0 then
+            -- Set primary target as closest player
+            TaskCombatPed(entity, players[1].ped, 0, 16)
+            return true
+        end
+    else
+        -- Attack only the nearest player
+        local nearestPlayer, distance = GetNearestAlivePlayer(entityCoords, searchRange)
+        if nearestPlayer then
+            TaskCombatPed(entity, nearestPlayer, 0, 16)
+            return true
+        end
+    end
+    
+    return false
+end
+
+-- Retarget all bandits
+function RetargetAllBandits()
+    local settings = getRetargetSettings()
+    local count = 0
+    
+    for _, bandit in pairs(adminSpawnedBandits) do
+        if DoesEntityExist(bandit) and not IsPedDeadOrDying(bandit, true) then
+            if RetargetEntity(bandit, settings.retargetRange) then
+                count = count + 1
+            end
+        end
+    end
+    
+    for _, npc in pairs(npcs) do
+        if DoesEntityExist(npc) and not IsPedDeadOrDying(npc, true) then
+            if RetargetEntity(npc, settings.retargetRange) then
+                count = count + 1
+            end
+        end
+    end
+    
+    return count
+end
+
+-- Retarget all zombies
+function RetargetAllZombies()
+    local settings = getRetargetSettings()
+    local count = 0
+    
+    for _, zombie in pairs(adminSpawnedZombies) do
+        if DoesEntityExist(zombie) and not IsPedDeadOrDying(zombie, true) then
+            if RetargetEntity(zombie, settings.retargetRange) then
+                count = count + 1
+            end
+        end
+    end
+    
+    return count
+end
+
+-- Retarget all enemies (bandits + zombies)
+function RetargetAllEnemies()
+    local bandits = RetargetAllBandits()
+    local zombies = RetargetAllZombies()
+    return bandits + zombies
+end
+
+-- ============================================
+-- CONTINUOUS TARGETING THREAD
+-- ============================================
+-- This thread continuously checks for player deaths and retargets enemies
+
+Citizen.CreateThread(function()
+    local lastPlayerState = {} -- Track player alive/dead states
+    
+    while true do
+        local settings = getRetargetSettings()
+        Wait(settings.checkInterval)
+        
+        if settings.enabled then
+            local allPlayers = GetActivePlayers()
+            local playerDied = false
+            
+            -- Check if any player just died
+            for _, playerId in ipairs(allPlayers) do
+                local playerPed = GetPlayerPed(playerId)
+                local isDead = IsPedDeadOrDying(playerPed, true)
+                local wasAlive = lastPlayerState[playerId] == false or lastPlayerState[playerId] == nil
+                
+                if isDead and wasAlive then
+                    playerDied = true
+                    print("[rsg-bandits] Player " .. playerId .. " died, triggering retarget")
+                end
+                
+                lastPlayerState[playerId] = isDead
+            end
+            
+            -- If a player died, wait a moment then retarget all enemies
+            if playerDied then
+                Wait(settings.retargetDelay)
+                local retargeted = RetargetAllEnemies()
+                if retargeted > 0 then
+                    print("[rsg-bandits] Retargeted " .. retargeted .. " enemies to new players")
+                end
+            end
+            
+            -- Also periodically retarget enemies that have no target or lost their target
+            if settings.aggroAllPlayersInRange then
+                RetargetIdleEnemies()
+            end
+        end
+    end
+end)
+
+-- Retarget enemies that are idle or have lost their target
+function RetargetIdleEnemies()
+    local settings = getRetargetSettings()
+    
+    -- Check admin spawned bandits
+    for _, bandit in pairs(adminSpawnedBandits) do
+        if DoesEntityExist(bandit) and not IsPedDeadOrDying(bandit, true) then
+            -- Check if bandit is not in combat or has no target
+            if not IsPedInCombat(bandit, 0) then
+                RetargetEntity(bandit, settings.retargetRange)
+            else
+                -- Check if current target is dead
+                local target = GetPedTaskCombatTarget(bandit, 0)
+                if target == 0 or not DoesEntityExist(target) or IsPedDeadOrDying(target, true) then
+                    RetargetEntity(bandit, settings.retargetRange)
+                end
+            end
+        end
+    end
+    
+    -- Check config bandits
+    for _, npc in pairs(npcs) do
+        if DoesEntityExist(npc) and not IsPedDeadOrDying(npc, true) then
+            if not IsPedInCombat(npc, 0) then
+                RetargetEntity(npc, settings.retargetRange)
+            else
+                local target = GetPedTaskCombatTarget(npc, 0)
+                if target == 0 or not DoesEntityExist(target) or IsPedDeadOrDying(target, true) then
+                    RetargetEntity(npc, settings.retargetRange)
+                end
+            end
+        end
+    end
+    
+    -- Check zombies
+    for _, zombie in pairs(adminSpawnedZombies) do
+        if DoesEntityExist(zombie) and not IsPedDeadOrDying(zombie, true) then
+            if not IsPedInCombat(zombie, 0) then
+                RetargetEntity(zombie, settings.retargetRange)
+            else
+                local target = GetPedTaskCombatTarget(zombie, 0)
+                if target == 0 or not DoesEntityExist(target) or IsPedDeadOrDying(target, true) then
+                    RetargetEntity(zombie, settings.retargetRange)
+                end
+            end
+        end
+    end
+end
+
+-- Helper function to get combat target
+function GetPedTaskCombatTarget(ped, p1)
+    return Citizen.InvokeNative(0xF9FC7AF4B07BD8F6, ped, Citizen.ReturnResultAnyway()) -- GET_PED_TARGET or similar
+end
+
+-- ============================================
+-- RESOURCE START/PLAYER LOAD
+-- ============================================
+
 AddEventHandler('onResourceStart', function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
     TriggerServerEvent('rsg-bandits:server:getSavedLocations')
@@ -132,6 +367,8 @@ function banditsTrigger(bandits, mounted)
     spawnbandits = true
     if mounted == nil then mounted = true end
     
+    local settings = getRetargetSettings()
+    
     for v, k in pairs(bandits) do
         local banditmodel = GetHashKey(Config.BanditsModel[math.random(1, #Config.BanditsModel)])
         local banditWeapon = Config.Weapons[math.random(1, #Config.Weapons)]
@@ -147,6 +384,11 @@ function banditsTrigger(bandits, mounted)
         
         GiveWeaponToPed(npcs[v], banditWeapon, 50, true, true, 1, false, 0.5, 1.0, 1.0, true, 0, 0)
         SetCurrentPedWeapon(npcs[v], banditWeapon, true)
+        
+        -- Enhanced combat attributes for better targeting
+        SetPedCombatAttributes(npcs[v], 46, true)
+        SetPedCombatAttributes(npcs[v], 5, true)
+        SetPedFleeAttributes(npcs[v], 0, false)
         
         trackedBandits[npcs[v]] = {
             isDead = false,
@@ -177,12 +419,17 @@ function banditsTrigger(bandits, mounted)
             Citizen.InvokeNative(0x028F76B6E78246EB, npcs[v], horse[v], -1)
         end
         
-        TaskCombatPed(npcs[v], PlayerPedId())
+        -- Target nearest player instead of just the spawning player
+        if settings.aggroAllPlayersInRange then
+            RetargetEntity(npcs[v], settings.retargetRange)
+        else
+            TaskCombatPed(npcs[v], PlayerPedId())
+        end
     end
 end
 
 -- ============================================
--- ZOMBIE SPAWN FUNCTION (NO HARD LIMITS)
+-- ZOMBIE SPAWN FUNCTION (WITH RETARGETING)
 -- ============================================
 function spawnZombiesAtLocation(coords, count, timer)
     if not coords or count <= 0 then return end
@@ -192,6 +439,7 @@ function spawnZombiesAtLocation(coords, count, timer)
     end
     
     local limits = getSpawnLimits()
+    local settings = getRetargetSettings()
     
     -- Check total zombie limit
     local currentZombies = #adminSpawnedZombies
@@ -281,22 +529,34 @@ function spawnZombiesAtLocation(coords, count, timer)
                 Citizen.InvokeNative(0x662D364ABF16DE2F, zombieBlip, 0xFF0000FF)
                 adminZombieBlips[#adminZombieBlips + 1] = zombieBlip
                 
-                TaskCombatPed(zombie, PlayerPedId())
+                -- Target nearest player instead of just the spawning player
+                if settings.aggroAllPlayersInRange then
+                    RetargetEntity(zombie, settings.retargetRange)
+                else
+                    TaskCombatPed(zombie, PlayerPedId())
+                end
                 
-                -- Start AI thread for this zombie
+                -- Start AI thread for this zombie with retargeting
                 local thisZombie = zombie
                 Citizen.CreateThread(function()
                     while DoesEntityExist(thisZombie) and not IsPedDeadOrDying(thisZombie, true) do
                         Wait(2000)
-                        local playerPed = PlayerPedId()
-                        local playerCoords = GetEntityCoords(playerPed)
-                        local zombieCoords = GetEntityCoords(thisZombie)
-                        local distance = GetDistanceBetweenCoords(playerCoords.x, playerCoords.y, playerCoords.z, zombieCoords.x, zombieCoords.y, zombieCoords.z)
                         
-                        if distance < (Config.ZombieSettings.aggroRange or 50.0) then
-                            if not IsPedInCombat(thisZombie, playerPed) then
-                                TaskCombatPed(thisZombie, playerPed)
+                        -- Check if current target is dead or out of range
+                        local shouldRetarget = false
+                        
+                        if not IsPedInCombat(thisZombie, 0) then
+                            shouldRetarget = true
+                        else
+                            -- Check if target is dead
+                            local currentTarget = GetPedTaskCombatTarget(thisZombie, 0)
+                            if currentTarget == 0 or not DoesEntityExist(currentTarget) or IsPedDeadOrDying(currentTarget, true) then
+                                shouldRetarget = true
                             end
+                        end
+                        
+                        if shouldRetarget then
+                            RetargetEntity(thisZombie, settings.retargetRange)
                         end
                     end
                 end)
@@ -374,43 +634,212 @@ Citizen.CreateThread(function()
             Wait(5000)
             TriggerServerEvent('rsg-bandits:server:robplayer')
             TriggerEvent('rNotify:NotifyLeft', "AND YOU HAVE BEEN ROBBED", "FAIL", "generic_textures", "tick", 4000)
-            for v, k in pairs(npcs) do
-                if banditBlips[v] and DoesBlipExist(banditBlips[v]) then
-                    RemoveBlip(banditBlips[v])
+            
+            -- Don't delete enemies if there are other players nearby
+            local settings = getRetargetSettings()
+            local myCoords = GetEntityCoords(PlayerPedId())
+            local otherPlayers = GetPlayersInRange(myCoords, settings.retargetRange)
+            
+            -- Only cleanup if no other alive players are nearby
+            if #otherPlayers <= 1 then -- 1 = just ourselves (dead)
+                for v, k in pairs(npcs) do
+                    if banditBlips[v] and DoesBlipExist(banditBlips[v]) then
+                        RemoveBlip(banditBlips[v])
+                    end
+                    trackedBandits[k] = nil
+                    DeleteEntity(k)
                 end
-                trackedBandits[k] = nil
-                DeleteEntity(k)
+                for v, k in pairs(horse) do
+                    DeleteEntity(k)
+                end
+                calloffbandits = false
+                spawnbandits = false
+                banditBlips = {}
+            else
+                -- Retarget to remaining players
+                Wait(settings.retargetDelay)
+                RetargetAllEnemies()
+                calloffbandits = false
+                spawnbandits = false
             end
-            for v, k in pairs(horse) do
-                DeleteEntity(k)
-            end
-            calloffbandits = false
-            spawnbandits = false
-            banditBlips = {}
             break
         end
         if calloffbandits == true then
-            for v, k in pairs(npcs) do
-                if banditBlips[v] and DoesBlipExist(banditBlips[v]) then
-                    RemoveBlip(banditBlips[v])
+            -- Check if other players are still in range before cleaning up
+            local settings = getRetargetSettings()
+            local myCoords = GetEntityCoords(PlayerPedId())
+            local otherPlayers = GetPlayersInRange(myCoords, settings.retargetRange)
+            
+            if #otherPlayers <= 1 then
+                for v, k in pairs(npcs) do
+                    if banditBlips[v] and DoesBlipExist(banditBlips[v]) then
+                        RemoveBlip(banditBlips[v])
+                    end
+                    trackedBandits[k] = nil
+                    DeleteEntity(k)
                 end
-                trackedBandits[k] = nil
-                DeleteEntity(k)
+                for v, k in pairs(horse) do
+                    DeleteEntity(k)
+                end
+                calloffbandits = false
+                spawnbandits = false
+                banditBlips = {}
+                TriggerEvent('rNotify:NotifyLeft', "BANDITS", "WATCH OUT", "generic_textures", "tick", 4000)
+            else
+                -- Don't cleanup - other players still engaging
+                calloffbandits = false
+                spawnbandits = false
             end
-            for v, k in pairs(horse) do
-                DeleteEntity(k)
-            end
-            calloffbandits = false
-            spawnbandits = false
-            banditBlips = {}
-            TriggerEvent('rNotify:NotifyLeft', "BANDITS", "WATCH OUT", "generic_textures", "tick", 4000)
             break
         end
     end
 end)
 
 -- ============================================
--- BANDIT SPAWN FUNCTION (NO HARD LIMITS)
+-- DEAD BODY CLEANUP THREAD
+-- ============================================
+Citizen.CreateThread(function()
+    local deadBodies = {} -- Track dead bodies with their death time
+    
+    while true do
+        Wait(5000) -- Check every 5 seconds
+        
+        local cleanupEnabled = (Config.DeadBodyCleanup and Config.DeadBodyCleanup.enabled) ~= false
+        local cleanupDelay = (Config.DeadBodyCleanup and Config.DeadBodyCleanup.delay) or 120
+        local currentTime = GetGameTimer()
+        
+        if cleanupEnabled then
+            -- Check admin spawned bandits
+            for i, bandit in pairs(adminSpawnedBandits) do
+                if DoesEntityExist(bandit) then
+                    if IsPedDeadOrDying(bandit, true) then
+                        if not deadBodies[bandit] then
+                            deadBodies[bandit] = {
+                                deathTime = currentTime,
+                                type = 'bandit',
+                                index = i
+                            }
+                        elseif (currentTime - deadBodies[bandit].deathTime) >= (cleanupDelay * 1000) then
+                            -- Remove blip if exists
+                            if adminBanditBlips[i] and DoesBlipExist(adminBanditBlips[i]) then
+                                RemoveBlip(adminBanditBlips[i])
+                                adminBanditBlips[i] = nil
+                            end
+                            DeleteEntity(bandit)
+                            adminSpawnedBandits[i] = nil
+                            trackedBandits[bandit] = nil
+                            deadBodies[bandit] = nil
+                        end
+                    end
+                else
+                    adminSpawnedBandits[i] = nil
+                    deadBodies[bandit] = nil
+                end
+            end
+            
+            -- Check config bandits (npcs table)
+            for i, npc in pairs(npcs) do
+                if DoesEntityExist(npc) then
+                    if IsPedDeadOrDying(npc, true) then
+                        if not deadBodies[npc] then
+                            deadBodies[npc] = {
+                                deathTime = currentTime,
+                                type = 'config_bandit',
+                                index = i
+                            }
+                        elseif (currentTime - deadBodies[npc].deathTime) >= (cleanupDelay * 1000) then
+                            if banditBlips[i] and DoesBlipExist(banditBlips[i]) then
+                                RemoveBlip(banditBlips[i])
+                                banditBlips[i] = nil
+                            end
+                            DeleteEntity(npc)
+                            npcs[i] = nil
+                            trackedBandits[npc] = nil
+                            deadBodies[npc] = nil
+                        end
+                    end
+                else
+                    npcs[i] = nil
+                    deadBodies[npc] = nil
+                end
+            end
+            
+            -- Check horses
+            for i, horseEntity in pairs(horse) do
+                if DoesEntityExist(horseEntity) then
+                    if IsPedDeadOrDying(horseEntity, true) then
+                        if not deadBodies[horseEntity] then
+                            deadBodies[horseEntity] = {
+                                deathTime = currentTime,
+                                type = 'horse',
+                                index = i
+                            }
+                        elseif (currentTime - deadBodies[horseEntity].deathTime) >= (cleanupDelay * 1000) then
+                            DeleteEntity(horseEntity)
+                            horse[i] = nil
+                            deadBodies[horseEntity] = nil
+                        end
+                    end
+                else
+                    horse[i] = nil
+                    deadBodies[horseEntity] = nil
+                end
+            end
+            
+            -- Check admin spawned horses
+            for i, horseEntity in pairs(adminSpawnedHorses) do
+                if DoesEntityExist(horseEntity) then
+                    if IsPedDeadOrDying(horseEntity, true) then
+                        if not deadBodies[horseEntity] then
+                            deadBodies[horseEntity] = {
+                                deathTime = currentTime,
+                                type = 'admin_horse',
+                                index = i
+                            }
+                        elseif (currentTime - deadBodies[horseEntity].deathTime) >= (cleanupDelay * 1000) then
+                            DeleteEntity(horseEntity)
+                            adminSpawnedHorses[i] = nil
+                            deadBodies[horseEntity] = nil
+                        end
+                    end
+                else
+                    adminSpawnedHorses[i] = nil
+                    deadBodies[horseEntity] = nil
+                end
+            end
+            
+            -- Check zombies
+            for i, zombie in pairs(adminSpawnedZombies) do
+                if DoesEntityExist(zombie) then
+                    if IsPedDeadOrDying(zombie, true) then
+                        if not deadBodies[zombie] then
+                            deadBodies[zombie] = {
+                                deathTime = currentTime,
+                                type = 'zombie',
+                                index = i
+                            }
+                        elseif (currentTime - deadBodies[zombie].deathTime) >= (cleanupDelay * 1000) then
+                            if adminZombieBlips[i] and DoesBlipExist(adminZombieBlips[i]) then
+                                RemoveBlip(adminZombieBlips[i])
+                                adminZombieBlips[i] = nil
+                            end
+                            DeleteEntity(zombie)
+                            adminSpawnedZombies[i] = nil
+                            trackedZombies[zombie] = nil
+                            deadBodies[zombie] = nil
+                        end
+                    end
+                else
+                    adminSpawnedZombies[i] = nil
+                    deadBodies[zombie] = nil
+                end
+            end
+        end
+    end
+end)
+
+-- ============================================
+-- BANDIT SPAWN FUNCTION (WITH RETARGETING)
 -- ============================================
 function spawnBanditsAtLocation(coords, count, timer, mounted)
     if not coords or count <= 0 then return end
@@ -418,6 +847,7 @@ function spawnBanditsAtLocation(coords, count, timer, mounted)
     if mounted == nil then mounted = true end
     
     local limits = getSpawnLimits()
+    local settings = getRetargetSettings()
     
     -- Check total bandit limit
     local currentBandits = #adminSpawnedBandits
@@ -475,6 +905,11 @@ function spawnBanditsAtLocation(coords, count, timer, mounted)
                 GiveWeaponToPed(bandit, banditWeapon, 50, true, true, 1, false, 0.5, 1.0, 1.0, true, 0, 0)
                 SetCurrentPedWeapon(bandit, banditWeapon, true)
                 
+                -- Enhanced combat attributes for better targeting
+                SetPedCombatAttributes(bandit, 46, true)
+                SetPedCombatAttributes(bandit, 5, true)
+                SetPedFleeAttributes(bandit, 0, false)
+                
                 trackedBandits[bandit] = {
                     isDead = false,
                     type = "admin"
@@ -509,7 +944,38 @@ function spawnBanditsAtLocation(coords, count, timer, mounted)
                     end
                 end
                 
-                TaskCombatPed(bandit, PlayerPedId())
+                -- Target nearest player or all players in range
+                if settings.aggroAllPlayersInRange then
+                    RetargetEntity(bandit, settings.retargetRange)
+                else
+                    TaskCombatPed(bandit, PlayerPedId())
+                end
+                
+                -- Start AI thread for this bandit with retargeting
+                local thisBandit = bandit
+                Citizen.CreateThread(function()
+                    while DoesEntityExist(thisBandit) and not IsPedDeadOrDying(thisBandit, true) do
+                        Wait(3000)
+                        
+                        -- Check if current target is dead or out of range
+                        local shouldRetarget = false
+                        
+                        if not IsPedInCombat(thisBandit, 0) then
+                            shouldRetarget = true
+                        else
+                            -- Check if target is dead
+                            local currentTarget = GetPedTaskCombatTarget(thisBandit, 0)
+                            if currentTarget == 0 or not DoesEntityExist(currentTarget) or IsPedDeadOrDying(currentTarget, true) then
+                                shouldRetarget = true
+                            end
+                        end
+                        
+                        if shouldRetarget then
+                            RetargetEntity(thisBandit, settings.retargetRange)
+                        end
+                    end
+                end)
+                
                 spawned = spawned + 1
             end
             
@@ -800,6 +1266,7 @@ end
 
 function openBanditMenu()
     local limits = getSpawnLimits()
+    local settings = getRetargetSettings()
     local currentBandits, currentZombies = getSpawnCounts()
     local contextOptions = {}
     
@@ -808,6 +1275,14 @@ function openBanditMenu()
         title = 'Current Status',
         description = 'Bandits: ' .. currentBandits .. '/' .. limits.totalBandits .. ' | Zombies: ' .. currentZombies .. '/' .. limits.totalZombies,
         icon = 'fas fa-info-circle',
+        disabled = true
+    })
+    
+    -- Retargeting status
+    table.insert(contextOptions, {
+        title = 'Retargeting: ' .. (settings.enabled and 'ON' or 'OFF'),
+        description = 'Range: ' .. settings.retargetRange .. 'm | Aggro All: ' .. (settings.aggroAllPlayersInRange and 'Yes' or 'No'),
+        icon = 'fas fa-crosshairs',
         disabled = true
     })
     
@@ -994,6 +1469,26 @@ function openBanditMenu()
         icon = 'fas fa-broom',
         onSelect = function()
             deleteAllSpawned()
+        end
+    })
+    
+    -- ============================================
+    -- RETARGETING CONTROLS
+    -- ============================================
+    table.insert(contextOptions, {
+        title = '--- TARGETING ---',
+        description = 'Force retarget all enemies',
+        icon = 'fas fa-crosshairs',
+        disabled = true
+    })
+    
+    table.insert(contextOptions, {
+        title = 'Force Retarget All Enemies',
+        description = 'Make all enemies target nearest players',
+        icon = 'fas fa-bullseye',
+        onSelect = function()
+            local count = RetargetAllEnemies()
+            TriggerEvent('rNotify:NotifyLeft', "RETARGET", count .. " enemies retargeted to nearest players", "generic_textures", "tick", 4000)
         end
     })
     
@@ -1287,7 +1782,7 @@ RegisterNetEvent('rsg-bandits:client:proximityTriggerDenied', function(locationI
     pendingProximityRequests[locationId] = nil
 end)
 
--- Register commands (NO HARD LIMITS - uses config)
+-- Register commands
 RegisterCommand('banditmenu', function()
     openBanditMenu()
 end, false)
@@ -1339,6 +1834,12 @@ end, false)
 
 RegisterCommand('addlocation', function()
     addLocationViaMenu()
+end, false)
+
+-- Command to force retarget all enemies
+RegisterCommand('retarget', function()
+    local count = RetargetAllEnemies()
+    TriggerEvent('rNotify:NotifyLeft', "RETARGET", count .. " enemies retargeted", "generic_textures", "tick", 4000)
 end, false)
 
 -- Command to show current spawn counts

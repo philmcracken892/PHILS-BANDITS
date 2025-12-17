@@ -205,6 +205,25 @@ Config.ZombieItemRewards = {
 }
 
 -------------------------------
+-- Dead Body Cleanup
+-------------------------------
+Config.DeadBodyCleanup = {
+    enabled = true,
+    delay = 120, -- seconds (2 minutes)
+}
+
+-------------------------------
+-- Aggression/Retargeting Settings
+-------------------------------
+Config.RetargetSettings = {
+    enabled = true,              -- Enable retargeting when player dies
+    retargetRange = 150.0,       -- Range to look for next player
+    retargetDelay = 2000,        -- Delay in ms before retargeting (gives time for death animation)
+    aggroAllPlayersInRange = true, -- If true, enemies will attack ALL players in range, not just one
+    checkInterval = 3000,        -- How often to check for new targets (ms)
+}
+
+-------------------------------
 -- Spawn Limits
 -------------------------------
 Config.SpawnLimits = {
