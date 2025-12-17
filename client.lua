@@ -15,9 +15,25 @@ local tempBanditLocations = {}
 local copiedCoords = nil
 local configBanditsEnabled = Config.EnableConfigBandits
 
--- Track which locations we've already requested (to prevent spam)
+-- Zombie tracking
+local adminSpawnedZombies = {}
+local adminZombieBlips = {}
+local trackedZombies = {}
+
+-- Track which locations we've already requested
 local pendingConfigRequests = {}
 local pendingProximityRequests = {}
+
+-- Get spawn limits from config or use defaults
+local function getSpawnLimits()
+    return {
+        banditsPerSpawn = (Config.SpawnLimits and Config.SpawnLimits.banditsPerSpawn) or 50,
+        zombiesPerSpawn = (Config.SpawnLimits and Config.SpawnLimits.zombiesPerSpawn) or 100,
+        totalBandits = (Config.SpawnLimits and Config.SpawnLimits.totalBandits) or 100,
+        totalZombies = (Config.SpawnLimits and Config.SpawnLimits.totalZombies) or 200,
+        hordeSize = (Config.SpawnLimits and Config.SpawnLimits.hordeSize) or 50,
+    }
+end
 
 AddEventHandler('onResourceStart', function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
@@ -43,8 +59,10 @@ RegisterNetEvent('rsg-bandits:client:loadSavedLocations', function(locations)
             coords = vector3(loc.coords.x, loc.coords.y, loc.coords.z),
             heading = loc.heading or 0.0,
             name = loc.name,
+            spawnType = loc.spawnType or 'bandit',
             banditType = loc.banditType or 'mounted',
             banditCount = loc.banditCount or 3,
+            zombieCount = loc.zombieCount or 0,
             timer = loc.timer or 0,
             proximity = loc.proximity or 0,
             initialDelay = loc.initialDelay or 60,
@@ -70,7 +88,7 @@ RegisterNetEvent('rsg-bandits:client:updateConfigBandits', function(enabled)
     end
 end)
 
--- Config bandits trigger loop - NOW USES SERVER CHECK
+-- Config bandits trigger loop
 Citizen.CreateThread(function()
     while true do
         Wait(1000)
@@ -81,13 +99,11 @@ Citizen.CreateThread(function()
                     local dis = GetDistanceBetweenCoords(coords.x, coords.y, coords.z, k.triggerPoint.x, k.triggerPoint.y, k.triggerPoint.z)
                     
                     if dis < Config.TriggerBandits and spawnbandits == false then
-                        -- Only request if we haven't already requested this location
                         if not pendingConfigRequests[v] then
                             pendingConfigRequests[v] = true
                             TriggerServerEvent('rsg-bandits:server:requestConfigTrigger', v)
                         end
                     else
-                        -- Reset pending request when player leaves trigger area
                         pendingConfigRequests[v] = nil
                     end
                     
@@ -100,7 +116,6 @@ Citizen.CreateThread(function()
     end
 end)
 
--- Server approved config bandit spawn
 RegisterNetEvent('rsg-bandits:client:triggerConfigBandits', function(configIndex)
     local k = Config.Bandits[configIndex]
     if k and spawnbandits == false then
@@ -109,11 +124,8 @@ RegisterNetEvent('rsg-bandits:client:triggerConfigBandits', function(configIndex
     pendingConfigRequests[configIndex] = nil
 end)
 
--- Server denied config trigger (cooldown)
 RegisterNetEvent('rsg-bandits:client:configTriggerDenied', function(configIndex, reason)
     pendingConfigRequests[configIndex] = nil
-    -- Optionally show message
-    -- TriggerEvent('rNotify:NotifyLeft', "BANDITS", reason or "Area already active", "generic_textures", "tick", 4000)
 end)
 
 function banditsTrigger(bandits, mounted)
@@ -168,6 +180,164 @@ function banditsTrigger(bandits, mounted)
         TaskCombatPed(npcs[v], PlayerPedId())
     end
 end
+
+-- ============================================
+-- ZOMBIE SPAWN FUNCTION (NO HARD LIMITS)
+-- ============================================
+function spawnZombiesAtLocation(coords, count, timer)
+    if not coords or count <= 0 then return end
+    if not Config.EnableZombies then
+        TriggerEvent('rNotify:NotifyLeft', "ZOMBIES", "Zombies are disabled in config", "generic_textures", "tick", 4000)
+        return
+    end
+    
+    local limits = getSpawnLimits()
+    
+    -- Check total zombie limit
+    local currentZombies = #adminSpawnedZombies
+    local remaining = limits.totalZombies - currentZombies
+    
+    if remaining <= 0 then
+        TriggerEvent('rNotify:NotifyLeft', "LIMIT REACHED", "Max " .. limits.totalZombies .. " zombies allowed. Delete some first.", "generic_textures", "tick", 4000)
+        return
+    end
+    
+    -- Adjust count if it would exceed total limit
+    if count > remaining then
+        TriggerEvent('rNotify:NotifyLeft', "ADJUSTED", "Spawning " .. remaining .. " zombies (limit: " .. limits.totalZombies .. ")", "generic_textures", "tick", 4000)
+        count = remaining
+    end
+    
+    if timer and timer > 0 then
+        TriggerEvent('rNotify:NotifyLeft', "SPAWN SCHEDULED", count .. " zombies will spawn in " .. timer .. " seconds", "generic_textures", "tick", 4000)
+        Citizen.CreateThread(function()
+            Wait(timer * 1000)
+            spawnZombiesAtLocation(coords, count, 0)
+        end)
+        return
+    end
+    
+    -- Spawn in batches to prevent lag
+    local batchSize = 10
+    local spawned = 0
+    
+    Citizen.CreateThread(function()
+        for i = 1, count do
+            local spawnCoords = vector3(
+                coords.x + math.random(-15, 15),
+                coords.y + math.random(-15, 15),
+                coords.z
+            )
+            
+            local zombieData = Config.ZombieModels[math.random(1, #Config.ZombieModels)]
+            local zombieModel = zombieData.model
+            local zombieOutfit = zombieData.outfit
+            
+            RequestModel(zombieModel)
+            local timeout = 0
+            while not HasModelLoaded(zombieModel) and timeout < 100 do 
+                Wait(10) 
+                timeout = timeout + 1
+            end
+            
+            if HasModelLoaded(zombieModel) then
+                local zombie = CreatePed(zombieModel, spawnCoords.x, spawnCoords.y, spawnCoords.z, math.random(0, 360), true, true, true, true)
+                adminSpawnedZombies[#adminSpawnedZombies + 1] = zombie
+                
+                Citizen.InvokeNative(0x283978A15512B2FE, zombie, true)
+                
+                if zombieOutfit > 0 then
+                    Citizen.InvokeNative(0x77FF8D35EEC6BBC4, zombie, zombieOutfit, false)
+                end
+                
+                SetEntityHealth(zombie, Config.ZombieSettings.health or 100, 0)
+                SetEntityMaxHealth(zombie, Config.ZombieSettings.health or 100)
+                
+                SetPedFleeAttributes(zombie, 0, false)
+                SetPedCombatAttributes(zombie, 46, true)
+                SetPedCombatAttributes(zombie, 5, true)
+                SetPedCombatAttributes(zombie, 0, true)
+                SetPedCombatAttributes(zombie, 2, true)
+                SetPedCombatAttributes(zombie, 3, true)
+                
+                Citizen.InvokeNative(0xF166E48407BAC484, zombie, 0, 2)
+                SetPedCombatRange(zombie, 0)
+                SetPedCombatAbility(zombie, 100)
+                
+                SetPedConfigFlag(zombie, 100, true)
+                SetPedConfigFlag(zombie, 281, true)
+                
+                if Config.ZombieSettings.canRun then
+                    Citizen.InvokeNative(0x6535C12D41C0F6FC, zombie, 3.0)
+                end
+                
+                trackedZombies[zombie] = {
+                    isDead = false,
+                    type = "admin"
+                }
+                
+                local zombieBlip = Citizen.InvokeNative(0x554D9D53F696D002, 0x84AD0C5B, GetEntityCoords(zombie))
+                Citizen.InvokeNative(0x9CB1A1623062F402, zombieBlip, "Zombie")
+                Citizen.InvokeNative(0x662D364ABF16DE2F, zombieBlip, 0xFF0000FF)
+                adminZombieBlips[#adminZombieBlips + 1] = zombieBlip
+                
+                TaskCombatPed(zombie, PlayerPedId())
+                
+                -- Start AI thread for this zombie
+                local thisZombie = zombie
+                Citizen.CreateThread(function()
+                    while DoesEntityExist(thisZombie) and not IsPedDeadOrDying(thisZombie, true) do
+                        Wait(2000)
+                        local playerPed = PlayerPedId()
+                        local playerCoords = GetEntityCoords(playerPed)
+                        local zombieCoords = GetEntityCoords(thisZombie)
+                        local distance = GetDistanceBetweenCoords(playerCoords.x, playerCoords.y, playerCoords.z, zombieCoords.x, zombieCoords.y, zombieCoords.z)
+                        
+                        if distance < (Config.ZombieSettings.aggroRange or 50.0) then
+                            if not IsPedInCombat(thisZombie, playerPed) then
+                                TaskCombatPed(thisZombie, playerPed)
+                            end
+                        end
+                    end
+                end)
+                
+                spawned = spawned + 1
+            end
+            
+            -- Small delay between spawns to prevent lag
+            if i % batchSize == 0 then
+                Wait(100)
+            else
+                Wait(10)
+            end
+        end
+        
+        TriggerEvent('rNotify:NotifyLeft', "ZOMBIES", spawned .. " zombies have risen!", "generic_textures", "tick", 4000)
+    end)
+end
+
+-- Zombie death tracking
+Citizen.CreateThread(function()
+    while true do
+        Wait(500)
+        for zombiePed, data in pairs(trackedZombies) do
+            if DoesEntityExist(zombiePed) then
+                if IsPedDeadOrDying(zombiePed, true) and not data.isDead then
+                    trackedZombies[zombiePed].isDead = true
+                    
+                    local playerPed = PlayerPedId()
+                    local killerPed = GetPedSourceOfDeath(zombiePed)
+                    
+                    if killerPed == playerPed or GetDistanceBetweenCoords(GetEntityCoords(playerPed), GetEntityCoords(zombiePed), true) < 50.0 then
+                        TriggerServerEvent('rsg-bandits:server:rewardZombieKill')
+                    end
+                end
+            else
+                trackedZombies[zombiePed] = nil
+            end
+        end
+    end
+end)
 
 -- Bandit death tracking and reward system
 Citizen.CreateThread(function()
@@ -239,11 +409,30 @@ Citizen.CreateThread(function()
     end
 end)
 
--- Modified spawn function with timer and mount support
+-- ============================================
+-- BANDIT SPAWN FUNCTION (NO HARD LIMITS)
+-- ============================================
 function spawnBanditsAtLocation(coords, count, timer, mounted)
     if not coords or count <= 0 then return end
     
     if mounted == nil then mounted = true end
+    
+    local limits = getSpawnLimits()
+    
+    -- Check total bandit limit
+    local currentBandits = #adminSpawnedBandits
+    local remaining = limits.totalBandits - currentBandits
+    
+    if remaining <= 0 then
+        TriggerEvent('rNotify:NotifyLeft', "LIMIT REACHED", "Max " .. limits.totalBandits .. " bandits allowed. Delete some first.", "generic_textures", "tick", 4000)
+        return
+    end
+    
+    -- Adjust count if it would exceed total limit
+    if count > remaining then
+        TriggerEvent('rNotify:NotifyLeft', "ADJUSTED", "Spawning " .. remaining .. " bandits (limit: " .. limits.totalBandits .. ")", "generic_textures", "tick", 4000)
+        count = remaining
+    end
     
     if timer and timer > 0 then
         local typeText = mounted and "mounted " or "on-foot "
@@ -255,64 +444,86 @@ function spawnBanditsAtLocation(coords, count, timer, mounted)
         return
     end
     
-    for i = 1, count do
-        local spawnCoords = vector3(
-            coords.x + math.random(-10, 10),
-            coords.y + math.random(-10, 10),
-            coords.z
-        )
-        
-        local banditmodel = GetHashKey(Config.BanditsModel[math.random(1, #Config.BanditsModel)])
-        local banditWeapon = Config.Weapons[math.random(1, #Config.Weapons)]
-        
-        RequestModel(banditmodel)
-        if not HasModelLoaded(banditmodel) then RequestModel(banditmodel) end
-        while not HasModelLoaded(banditmodel) do Wait(1) end
-        Citizen.Wait(100)
-        
-        local bandit = CreatePed(banditmodel, spawnCoords, true, true, true, true)
-        adminSpawnedBandits[#adminSpawnedBandits + 1] = bandit
-        
-        Citizen.InvokeNative(0x283978A15512B2FE, bandit, true)
-        Citizen.InvokeNative(0x23f74c2fda6e7c61, 953018525, bandit)
-        GiveWeaponToPed(bandit, banditWeapon, 50, true, true, 1, false, 0.5, 1.0, 1.0, true, 0, 0)
-        SetCurrentPedWeapon(bandit, banditWeapon, true)
-        
-        trackedBandits[bandit] = {
-            isDead = false,
-            type = "admin"
-        }
-        
-        local banditBlip = Citizen.InvokeNative(0x554D9D53F696D002, 0x84AD0C5B, GetEntityCoords(bandit))
-        SetBlipSprite(banditBlip, 0x84AD0C5B)
-        Citizen.InvokeNative(0x9CB1A1623062F402, banditBlip, mounted and "Mounted Bandit" or "Bandit on Foot")
-        adminBanditBlips[#adminBanditBlips + 1] = banditBlip
-        
-        if mounted then
-            local horsemodel = GetHashKey(Config.HorseModels[math.random(1, #Config.HorseModels)])
+    -- Spawn in batches to prevent lag
+    local batchSize = 5
+    local spawned = 0
+    
+    Citizen.CreateThread(function()
+        for i = 1, count do
+            local spawnCoords = vector3(
+                coords.x + math.random(-15, 15),
+                coords.y + math.random(-15, 15),
+                coords.z
+            )
             
-            RequestModel(horsemodel)
-            if not HasModelLoaded(horsemodel) then RequestModel(horsemodel) end
-            while not HasModelLoaded(horsemodel) do Wait(1) end
-            Citizen.Wait(100)
+            local banditmodel = GetHashKey(Config.BanditsModel[math.random(1, #Config.BanditsModel)])
+            local banditWeapon = Config.Weapons[math.random(1, #Config.Weapons)]
             
-            local banditHorse = CreatePed(horsemodel, spawnCoords, true, true, true, true)
-            adminSpawnedHorses[#adminSpawnedHorses + 1] = banditHorse
+            RequestModel(banditmodel)
+            local timeout = 0
+            while not HasModelLoaded(banditmodel) and timeout < 100 do 
+                Wait(10) 
+                timeout = timeout + 1
+            end
             
-            Citizen.InvokeNative(0x283978A15512B2FE, banditHorse, true)
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0x20359E53, true, true, true)
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0x508B80B9, true, true, true)
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0xF0C30271, true, true, true)
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0x12F0DF9F, true, true, true)
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0x67AF7302, true, true, true)
-            Citizen.InvokeNative(0x028F76B6E78246EB, bandit, banditHorse, -1)
+            if HasModelLoaded(banditmodel) then
+                local bandit = CreatePed(banditmodel, spawnCoords, true, true, true, true)
+                adminSpawnedBandits[#adminSpawnedBandits + 1] = bandit
+                
+                Citizen.InvokeNative(0x283978A15512B2FE, bandit, true)
+                Citizen.InvokeNative(0x23f74c2fda6e7c61, 953018525, bandit)
+                GiveWeaponToPed(bandit, banditWeapon, 50, true, true, 1, false, 0.5, 1.0, 1.0, true, 0, 0)
+                SetCurrentPedWeapon(bandit, banditWeapon, true)
+                
+                trackedBandits[bandit] = {
+                    isDead = false,
+                    type = "admin"
+                }
+                
+                local banditBlip = Citizen.InvokeNative(0x554D9D53F696D002, 0x84AD0C5B, GetEntityCoords(bandit))
+                SetBlipSprite(banditBlip, 0x84AD0C5B)
+                Citizen.InvokeNative(0x9CB1A1623062F402, banditBlip, mounted and "Mounted Bandit" or "Bandit on Foot")
+                adminBanditBlips[#adminBanditBlips + 1] = banditBlip
+                
+                if mounted then
+                    local horsemodel = GetHashKey(Config.HorseModels[math.random(1, #Config.HorseModels)])
+                    
+                    RequestModel(horsemodel)
+                    local horseTimeout = 0
+                    while not HasModelLoaded(horsemodel) and horseTimeout < 100 do 
+                        Wait(10) 
+                        horseTimeout = horseTimeout + 1
+                    end
+                    
+                    if HasModelLoaded(horsemodel) then
+                        local banditHorse = CreatePed(horsemodel, spawnCoords, true, true, true, true)
+                        adminSpawnedHorses[#adminSpawnedHorses + 1] = banditHorse
+                        
+                        Citizen.InvokeNative(0x283978A15512B2FE, banditHorse, true)
+                        Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0x20359E53, true, true, true)
+                        Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0x508B80B9, true, true, true)
+                        Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0xF0C30271, true, true, true)
+                        Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0x12F0DF9F, true, true, true)
+                        Citizen.InvokeNative(0xD3A7B003ED343FD9, banditHorse, 0x67AF7302, true, true, true)
+                        Citizen.InvokeNative(0x028F76B6E78246EB, bandit, banditHorse, -1)
+                    end
+                end
+                
+                TaskCombatPed(bandit, PlayerPedId())
+                spawned = spawned + 1
+            end
+            
+            -- Small delay between spawns to prevent lag
+            if i % batchSize == 0 then
+                Wait(200)
+            else
+                Wait(50)
+            end
         end
         
-        TaskCombatPed(bandit, PlayerPedId())
-    end
-    
-    local typeText = mounted and "MOUNTED BANDITS" or "BANDITS ON FOOT"
-    TriggerEvent('rNotify:NotifyLeft', typeText, count .. " have seen you!", "generic_textures", "tick", 4000)
+        local typeText = mounted and "MOUNTED BANDITS" or "BANDITS ON FOOT"
+        TriggerEvent('rNotify:NotifyLeft', typeText, spawned .. " have seen you!", "generic_textures", "tick", 4000)
+    end)
 end
 
 function deleteAllAdminBandits()
@@ -354,7 +565,56 @@ function deleteAllAdminBandits()
     TriggerEvent('rNotify:NotifyLeft', "ADMIN DELETE", count .. " admin bandits deleted!", "generic_textures", "tick", 4000)
 end
 
+function deleteAllZombies()
+    local count = 0
+    
+    for _, blip in pairs(adminZombieBlips) do
+        if DoesBlipExist(blip) then
+            RemoveBlip(blip)
+        end
+    end
+    
+    for _, zombie in pairs(adminSpawnedZombies) do
+        if DoesEntityExist(zombie) then
+            trackedZombies[zombie] = nil
+            DeleteEntity(zombie)
+            count = count + 1
+        end
+    end
+    
+    adminSpawnedZombies = {}
+    adminZombieBlips = {}
+    
+    TriggerEvent('rNotify:NotifyLeft', "ZOMBIES DELETED", count .. " zombies removed!", "generic_textures", "tick", 4000)
+end
+
+function deleteAllSpawned()
+    deleteAllAdminBandits()
+    deleteAllZombies()
+end
+
+-- Get current spawn counts for display
+function getSpawnCounts()
+    local bandits = 0
+    local zombies = 0
+    
+    for _, bandit in pairs(adminSpawnedBandits) do
+        if DoesEntityExist(bandit) and not IsPedDeadOrDying(bandit, true) then
+            bandits = bandits + 1
+        end
+    end
+    
+    for _, zombie in pairs(adminSpawnedZombies) do
+        if DoesEntityExist(zombie) and not IsPedDeadOrDying(zombie, true) then
+            zombies = zombies + 1
+        end
+    end
+    
+    return bandits, zombies
+end
+
 function addLocationViaMenu()
+    local limits = getSpawnLimits()
     local contextOptions = {}
     
     table.insert(contextOptions, {
@@ -364,15 +624,21 @@ function addLocationViaMenu()
         onSelect = function()
             local input = lib.inputDialog('Add New Location', {
                 {type = 'input', label = 'Location Name', placeholder = 'Enter a name for this location', required = true},
+                {type = 'select', label = 'Spawn Type', options = {
+                    {value = 'bandit', label = 'Bandits Only'},
+                    {value = 'zombie', label = 'Zombies Only'},
+                    {value = 'both', label = 'Bandits + Zombies'}
+                }, default = 'bandit'},
                 {type = 'select', label = 'Bandit Type', options = {
                     {value = 'mounted', label = 'Mounted'},
                     {value = 'foot', label = 'On Foot'},
                     {value = 'mixed', label = 'Mixed (50/50)'}
                 }, default = 'mounted'},
-                {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10},
-                {type = 'number', label = 'Spawn Delay (seconds)', description = 'Delay before bandits spawn (0 for immediate)', default = 0, min = 0},
+                {type = 'number', label = 'Number of Bandits', default = 3, min = 0, max = limits.banditsPerSpawn},
+                {type = 'number', label = 'Number of Zombies', default = 0, min = 0, max = limits.zombiesPerSpawn},
+                {type = 'number', label = 'Spawn Delay (seconds)', description = 'Delay before spawn (0 for immediate)', default = 0, min = 0},
                 {type = 'number', label = 'Proximity Radius (meters)', description = 'Radius to trigger spawn (0 for manual only)', default = 0, min = 0},
-                {type = 'number', label = 'Initial Delay (seconds)', description = 'Delay before proximity trigger activates (0 for immediate)', default = 60, min = 0},
+                {type = 'number', label = 'Initial Delay (seconds)', description = 'Delay before proximity trigger activates', default = 60, min = 0},
                 {type = 'number', label = 'Cooldown (seconds)', description = 'Cooldown before proximity can trigger again', default = 300, min = 0},
                 {type = 'checkbox', label = 'Enabled', description = 'Whether this location is active', checked = true}
             })
@@ -385,13 +651,15 @@ function addLocationViaMenu()
                     coords = {x = coords.x, y = coords.y, z = coords.z},
                     heading = heading,
                     name = input[1],
-                    banditType = input[2] or 'mounted',
-                    banditCount = input[3] or 3,
-                    timer = input[4] or 0,
-                    proximity = input[5] or 0,
-                    initialDelay = input[6] or 60,
-                    cooldown = input[7] or 300,
-                    enabled = input[8] ~= false
+                    spawnType = input[2] or 'bandit',
+                    banditType = input[3] or 'mounted',
+                    banditCount = input[4] or 3,
+                    zombieCount = input[5] or 0,
+                    timer = input[6] or 0,
+                    proximity = input[7] or 0,
+                    initialDelay = input[8] or 60,
+                    cooldown = input[9] or 300,
+                    enabled = input[10] ~= false
                 })
             end
         end
@@ -429,17 +697,23 @@ function addLocationViaMenu()
                     {type = 'number', label = 'Y Coordinate', default = copiedCoords.y, required = true},
                     {type = 'number', label = 'Z Coordinate', default = copiedCoords.z, required = true},
                     {type = 'number', label = 'Heading', default = copiedCoords.heading, required = true},
+                    {type = 'select', label = 'Spawn Type', options = {
+                        {value = 'bandit', label = 'Bandits Only'},
+                        {value = 'zombie', label = 'Zombies Only'},
+                        {value = 'both', label = 'Bandits + Zombies'}
+                    }, default = 'bandit'},
                     {type = 'select', label = 'Bandit Type', options = {
                         {value = 'mounted', label = 'Mounted'},
                         {value = 'foot', label = 'On Foot'},
                         {value = 'mixed', label = 'Mixed (50/50)'}
                     }, default = 'mounted'},
-                    {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10},
-                    {type = 'number', label = 'Spawn Delay (seconds)', description = 'Delay before bandits spawn (0 for immediate)', default = 0, min = 0},
-                    {type = 'number', label = 'Proximity Radius (meters)', description = 'Radius to trigger spawn (0 for manual only)', default = 0, min = 0},
-                    {type = 'number', label = 'Initial Delay (seconds)', description = 'Delay before proximity trigger activates (0 for immediate)', default = 60, min = 0},
-                    {type = 'number', label = 'Cooldown (seconds)', description = 'Cooldown before proximity can trigger again', default = 300, min = 0},
-                    {type = 'checkbox', label = 'Enabled', description = 'Whether this location is active', checked = true}
+                    {type = 'number', label = 'Number of Bandits', default = 3, min = 0, max = limits.banditsPerSpawn},
+                    {type = 'number', label = 'Number of Zombies', default = 0, min = 0, max = limits.zombiesPerSpawn},
+                    {type = 'number', label = 'Spawn Delay (seconds)', default = 0, min = 0},
+                    {type = 'number', label = 'Proximity Radius (meters)', default = 0, min = 0},
+                    {type = 'number', label = 'Initial Delay (seconds)', default = 60, min = 0},
+                    {type = 'number', label = 'Cooldown (seconds)', default = 300, min = 0},
+                    {type = 'checkbox', label = 'Enabled', checked = true}
                 })
                 
                 if input and input[1] then
@@ -447,13 +721,15 @@ function addLocationViaMenu()
                         coords = {x = input[2], y = input[3], z = input[4]},
                         heading = input[5],
                         name = input[1],
-                        banditType = input[6] or 'mounted',
-                        banditCount = input[7] or 3,
-                        timer = input[8] or 0,
-                        proximity = input[9] or 0,
-                        initialDelay = input[10] or 60,
-                        cooldown = input[11] or 300,
-                        enabled = input[12] ~= false
+                        spawnType = input[6] or 'bandit',
+                        banditType = input[7] or 'mounted',
+                        banditCount = input[8] or 3,
+                        zombieCount = input[9] or 0,
+                        timer = input[10] or 0,
+                        proximity = input[11] or 0,
+                        initialDelay = input[12] or 60,
+                        cooldown = input[13] or 300,
+                        enabled = input[14] ~= false
                     })
                 end
             end
@@ -474,17 +750,23 @@ function addLocationViaMenu()
                 {type = 'number', label = 'Y Coordinate', placeholder = 'Current: ' .. string.format("%.2f", coords.y), required = true},
                 {type = 'number', label = 'Z Coordinate', placeholder = 'Current: ' .. string.format("%.2f", coords.z), required = true},
                 {type = 'number', label = 'Heading', placeholder = 'Current: ' .. string.format("%.2f", heading), default = heading},
+                {type = 'select', label = 'Spawn Type', options = {
+                    {value = 'bandit', label = 'Bandits Only'},
+                    {value = 'zombie', label = 'Zombies Only'},
+                    {value = 'both', label = 'Bandits + Zombies'}
+                }, default = 'bandit'},
                 {type = 'select', label = 'Bandit Type', options = {
                     {value = 'mounted', label = 'Mounted'},
                     {value = 'foot', label = 'On Foot'},
                     {value = 'mixed', label = 'Mixed (50/50)'}
                 }, default = 'mounted'},
-                {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10},
-                {type = 'number', label = 'Spawn Delay (seconds)', description = 'Delay before bandits spawn (0 for immediate)', default = 0, min = 0},
-                {type = 'number', label = 'Proximity Radius (meters)', description = 'Radius to trigger spawn (0 for manual only)', default = 0, min = 0},
-                {type = 'number', label = 'Initial Delay (seconds)', description = 'Delay before proximity trigger activates (0 for immediate)', default = 60, min = 0},
-                {type = 'number', label = 'Cooldown (seconds)', description = 'Cooldown before proximity can trigger again', default = 300, min = 0},
-                {type = 'checkbox', label = 'Enabled', description = 'Whether this location is active', checked = true}
+                {type = 'number', label = 'Number of Bandits', default = 3, min = 0, max = limits.banditsPerSpawn},
+                {type = 'number', label = 'Number of Zombies', default = 0, min = 0, max = limits.zombiesPerSpawn},
+                {type = 'number', label = 'Spawn Delay (seconds)', default = 0, min = 0},
+                {type = 'number', label = 'Proximity Radius (meters)', default = 0, min = 0},
+                {type = 'number', label = 'Initial Delay (seconds)', default = 60, min = 0},
+                {type = 'number', label = 'Cooldown (seconds)', default = 300, min = 0},
+                {type = 'checkbox', label = 'Enabled', checked = true}
             })
             
             if input and input[1] and input[2] and input[3] and input[4] then
@@ -492,13 +774,15 @@ function addLocationViaMenu()
                     coords = {x = input[2], y = input[3], z = input[4]},
                     heading = input[5] or heading,
                     name = input[1],
-                    banditType = input[6] or 'mounted',
-                    banditCount = input[7] or 3,
-                    timer = input[8] or 0,
-                    proximity = input[9] or 0,
-                    initialDelay = input[10] or 60,
-                    cooldown = input[11] or 300,
-                    enabled = input[12] ~= false
+                    spawnType = input[6] or 'bandit',
+                    banditType = input[7] or 'mounted',
+                    banditCount = input[8] or 3,
+                    zombieCount = input[9] or 0,
+                    timer = input[10] or 0,
+                    proximity = input[11] or 0,
+                    initialDelay = input[12] or 60,
+                    cooldown = input[13] or 300,
+                    enabled = input[14] ~= false
                 })
             end
         end
@@ -515,7 +799,27 @@ function addLocationViaMenu()
 end
 
 function openBanditMenu()
+    local limits = getSpawnLimits()
+    local currentBandits, currentZombies = getSpawnCounts()
     local contextOptions = {}
+    
+    -- Status display
+    table.insert(contextOptions, {
+        title = 'Current Status',
+        description = 'Bandits: ' .. currentBandits .. '/' .. limits.totalBandits .. ' | Zombies: ' .. currentZombies .. '/' .. limits.totalZombies,
+        icon = 'fas fa-info-circle',
+        disabled = true
+    })
+    
+    -- ============================================
+    -- BANDIT SECTION
+    -- ============================================
+    table.insert(contextOptions, {
+        title = '--- BANDITS ---',
+        description = 'Spawn and manage bandits (Max per spawn: ' .. limits.banditsPerSpawn .. ')',
+        icon = 'fas fa-skull-crossbones',
+        disabled = true
+    })
     
     table.insert(contextOptions, {
         title = 'Spawn Mounted Bandits',
@@ -523,7 +827,7 @@ function openBanditMenu()
         icon = 'fas fa-horse',
         onSelect = function()
             local input = lib.inputDialog('Spawn Mounted Bandits', {
-                {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10, required = true}
+                {type = 'number', label = 'Number of Bandits (Max: ' .. limits.banditsPerSpawn .. ')', default = 3, min = 1, max = limits.banditsPerSpawn, required = true}
             })
             
             if input and input[1] then
@@ -539,7 +843,7 @@ function openBanditMenu()
         icon = 'fas fa-walking',
         onSelect = function()
             local input = lib.inputDialog('Spawn Bandits on Foot', {
-                {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10, required = true}
+                {type = 'number', label = 'Number of Bandits (Max: ' .. limits.banditsPerSpawn .. ')', default = 3, min = 1, max = limits.banditsPerSpawn, required = true}
             })
             
             if input and input[1] then
@@ -555,7 +859,7 @@ function openBanditMenu()
         icon = 'fas fa-dice',
         onSelect = function()
             local input = lib.inputDialog('Spawn Mixed Bandits', {
-                {type = 'number', label = 'Total Number of Bandits', default = 6, min = 2, max = 10, required = true},
+                {type = 'number', label = 'Total Number of Bandits (Max: ' .. limits.banditsPerSpawn .. ')', default = 6, min = 2, max = limits.banditsPerSpawn, required = true},
                 {type = 'number', label = 'Percentage Mounted (0-100)', default = 50, min = 0, max = 100, required = true}
             })
             
@@ -578,12 +882,129 @@ function openBanditMenu()
     })
     
     table.insert(contextOptions, {
-        title = 'Delete All Admin Bandits',
+        title = 'Delete All Bandits (' .. currentBandits .. ')',
         description = 'Remove all admin spawned bandits and horses',
         icon = 'fas fa-trash',
         onSelect = function()
             deleteAllAdminBandits()
         end
+    })
+    
+    -- ============================================
+    -- ZOMBIE SECTION
+    -- ============================================
+    table.insert(contextOptions, {
+        title = '--- ZOMBIES ---',
+        description = 'Spawn and manage zombies (Max per spawn: ' .. limits.zombiesPerSpawn .. ')',
+        icon = 'fas fa-biohazard',
+        disabled = true
+    })
+    
+    table.insert(contextOptions, {
+        title = 'Spawn Zombies',
+        description = 'Spawn zombies at your location',
+        icon = 'fas fa-biohazard',
+        onSelect = function()
+            local input = lib.inputDialog('Spawn Zombies', {
+                {type = 'number', label = 'Number of Zombies (Max: ' .. limits.zombiesPerSpawn .. ')', default = 5, min = 1, max = limits.zombiesPerSpawn, required = true}
+            })
+            
+            if input and input[1] then
+                local coords = GetEntityCoords(PlayerPedId())
+                spawnZombiesAtLocation(coords, input[1], 0)
+            end
+        end
+    })
+    
+    table.insert(contextOptions, {
+        title = 'Spawn Zombie Horde',
+        description = 'Spawn a large horde of zombies (Max: ' .. limits.hordeSize .. ')',
+        icon = 'fas fa-skull',
+        onSelect = function()
+            local input = lib.inputDialog('Spawn Zombie Horde', {
+                {type = 'number', label = 'Horde Size (Max: ' .. limits.hordeSize .. ')', default = 20, min = 5, max = limits.hordeSize, required = true},
+                {type = 'number', label = 'Spawn Delay (seconds)', default = 0, min = 0, max = 60}
+            })
+            
+            if input and input[1] then
+                local coords = GetEntityCoords(PlayerPedId())
+                spawnZombiesAtLocation(coords, input[1], input[2] or 0)
+            end
+        end
+    })
+    
+    table.insert(contextOptions, {
+        title = 'Delete All Zombies (' .. currentZombies .. ')',
+        description = 'Remove all spawned zombies',
+        icon = 'fas fa-trash-alt',
+        onSelect = function()
+            deleteAllZombies()
+        end
+    })
+    
+    -- ============================================
+    -- MIXED SPAWN SECTION
+    -- ============================================
+    table.insert(contextOptions, {
+        title = '--- MIXED SPAWNS ---',
+        description = 'Spawn both bandits and zombies',
+        icon = 'fas fa-users',
+        disabled = true
+    })
+    
+    table.insert(contextOptions, {
+        title = 'Spawn Bandits + Zombies',
+        description = 'Spawn both at your location',
+        icon = 'fas fa-users-slash',
+        onSelect = function()
+            local input = lib.inputDialog('Spawn Mixed Enemies', {
+                {type = 'number', label = 'Number of Bandits (Max: ' .. limits.banditsPerSpawn .. ')', default = 3, min = 0, max = limits.banditsPerSpawn, required = true},
+                {type = 'select', label = 'Bandit Type', options = {
+                    {value = 'mounted', label = 'Mounted'},
+                    {value = 'foot', label = 'On Foot'},
+                    {value = 'mixed', label = 'Mixed'}
+                }, default = 'mounted'},
+                {type = 'number', label = 'Number of Zombies (Max: ' .. limits.zombiesPerSpawn .. ')', default = 5, min = 0, max = limits.zombiesPerSpawn, required = true}
+            })
+            
+            if input then
+                local coords = GetEntityCoords(PlayerPedId())
+                
+                if input[1] and input[1] > 0 then
+                    if input[2] == 'mixed' then
+                        local mounted = math.floor(input[1] / 2)
+                        local onFoot = input[1] - mounted
+                        spawnBanditsAtLocation(coords, mounted, 0, true)
+                        spawnBanditsAtLocation(coords, onFoot, 0, false)
+                    else
+                        spawnBanditsAtLocation(coords, input[1], 0, input[2] == 'mounted')
+                    end
+                end
+                
+                if input[3] and input[3] > 0 then
+                    spawnZombiesAtLocation(coords, input[3], 0)
+                end
+            end
+        end
+    })
+    
+    table.insert(contextOptions, {
+        title = 'Delete All Spawned (' .. (currentBandits + currentZombies) .. ')',
+        description = 'Remove all bandits AND zombies',
+        icon = 'fas fa-broom',
+        onSelect = function()
+            deleteAllSpawned()
+        end
+    })
+    
+    -- ============================================
+    -- LOCATION MANAGEMENT
+    -- ============================================
+    table.insert(contextOptions, {
+        title = '--- LOCATIONS ---',
+        description = 'Manage spawn locations',
+        icon = 'fas fa-map',
+        disabled = true
     })
     
     table.insert(contextOptions, {
@@ -608,7 +1029,7 @@ function openBanditMenu()
     
     lib.registerContext({
         id = 'bandit_admin_menu',
-        title = 'Bandit Admin Menu',
+        title = 'Enemy Spawn Menu',
         options = contextOptions
     })
     
@@ -620,18 +1041,34 @@ function openSavedLocationsMenu()
     
     for i, location in ipairs(tempBanditLocations) do
         local statusIcon = location.enabled and '[ON]' or '[OFF]'
-        local banditIcon = ''
-        if location.banditType == 'mounted' then
-            banditIcon = '[M]'
-        elseif location.banditType == 'foot' then
-            banditIcon = '[F]'
+        local typeIcon = ''
+        
+        if location.spawnType == 'zombie' then
+            typeIcon = '[Z]'
+        elseif location.spawnType == 'both' then
+            typeIcon = '[B+Z]'
         else
-            banditIcon = '[X]'
+            if location.banditType == 'mounted' then
+                typeIcon = '[M]'
+            elseif location.banditType == 'foot' then
+                typeIcon = '[F]'
+            else
+                typeIcon = '[X]'
+            end
+        end
+        
+        local countText = ''
+        if location.spawnType == 'zombie' then
+            countText = 'Zombies: ' .. (location.zombieCount or 0)
+        elseif location.spawnType == 'both' then
+            countText = 'B: ' .. (location.banditCount or 0) .. ' | Z: ' .. (location.zombieCount or 0)
+        else
+            countText = 'Bandits: ' .. (location.banditCount or 0)
         end
         
         table.insert(contextOptions, {
-            title = statusIcon .. ' ' .. banditIcon .. ' ' .. location.name,
-            description = 'Type: ' .. location.banditType .. ' | Count: ' .. location.banditCount .. ' | Proximity: ' .. location.proximity .. 'm | By: ' .. (location.createdBy or 'Unknown'),
+            title = statusIcon .. ' ' .. typeIcon .. ' ' .. location.name,
+            description = countText .. ' | Proximity: ' .. location.proximity .. 'm | By: ' .. (location.createdBy or 'Unknown'),
             icon = 'fas fa-map-marker',
             onSelect = function()
                 openLocationActionsMenu(i, location)
@@ -650,36 +1087,46 @@ function openSavedLocationsMenu()
 end
 
 function openLocationActionsMenu(index, location)
+    local limits = getSpawnLimits()
     local contextOptions = {}
     
-    local typeIcon = location.banditType == 'mounted' and '[M]' or location.banditType == 'foot' and '[F]' or '[X]'
+    local typeText = location.spawnType == 'zombie' and 'Zombies' or location.spawnType == 'both' and 'Mixed' or 'Bandits'
     
     table.insert(contextOptions, {
-        title = 'Spawn Bandits Here',
-        description = typeIcon .. ' Type: ' .. location.banditType .. ' | Count: ' .. location.banditCount .. (location.timer > 0 and ' | Timer: ' .. location.timer .. 's' or ''),
+        title = 'Spawn Here Now',
+        description = 'Type: ' .. typeText .. (location.timer > 0 and ' | Timer: ' .. location.timer .. 's' or ''),
         icon = 'fas fa-user-ninja',
         onSelect = function()
-            local input = lib.inputDialog('Spawn Bandits', {
-                {type = 'number', label = 'Number of Bandits', default = location.banditCount or 3, min = 1, max = 10, required = true},
-                {type = 'select', label = 'Override Type', options = {
-                    {value = 'default', label = 'Use Saved Setting (' .. location.banditType .. ')'},
+            local input = lib.inputDialog('Spawn at ' .. location.name, {
+                {type = 'number', label = 'Number of Bandits', default = location.banditCount or 3, min = 0, max = limits.banditsPerSpawn},
+                {type = 'number', label = 'Number of Zombies', default = location.zombieCount or 0, min = 0, max = limits.zombiesPerSpawn},
+                {type = 'select', label = 'Bandit Type', options = {
+                    {value = 'default', label = 'Use Saved (' .. (location.banditType or 'mounted') .. ')'},
                     {value = 'mounted', label = 'Force Mounted'},
                     {value = 'foot', label = 'Force On Foot'},
                     {value = 'mixed', label = 'Force Mixed'}
                 }, default = 'default'}
             })
             
-            if input and input[1] then
-                local banditType = input[2] == 'default' and (location.banditType or 'mounted') or input[2]
+            if input then
+                local banditCount = input[1] or 0
+                local zombieCount = input[2] or 0
+                local banditType = input[3] == 'default' and (location.banditType or 'mounted') or input[3]
                 
-                if banditType == 'mixed' then
-                    local mounted = math.floor(input[1] / 2)
-                    local onFoot = input[1] - mounted
-                    spawnBanditsAtLocation(location.coords, mounted, location.timer, true)
-                    spawnBanditsAtLocation(location.coords, onFoot, location.timer, false)
-                else
-                    local isMounted = banditType == 'mounted'
-                    spawnBanditsAtLocation(location.coords, input[1], location.timer, isMounted)
+                if banditCount > 0 then
+                    if banditType == 'mixed' then
+                        local mounted = math.floor(banditCount / 2)
+                        local onFoot = banditCount - mounted
+                        spawnBanditsAtLocation(location.coords, mounted, location.timer, true)
+                        spawnBanditsAtLocation(location.coords, onFoot, location.timer, false)
+                    else
+                        local isMounted = banditType == 'mounted'
+                        spawnBanditsAtLocation(location.coords, banditCount, location.timer, isMounted)
+                    end
+                end
+                
+                if zombieCount > 0 then
+                    spawnZombiesAtLocation(location.coords, zombieCount, location.timer)
                 end
             end
         end
@@ -707,8 +1154,10 @@ function openLocationActionsMenu(index, location)
                 coords = {x = location.coords.x, y = location.coords.y, z = location.coords.z},
                 heading = location.heading,
                 name = location.name,
+                spawnType = location.spawnType,
                 banditType = location.banditType,
                 banditCount = location.banditCount,
+                zombieCount = location.zombieCount,
                 timer = location.timer,
                 proximity = location.proximity,
                 initialDelay = location.initialDelay,
@@ -748,53 +1197,7 @@ function openLocationActionsMenu(index, location)
     lib.showContext('location_actions_menu')
 end
 
-function openConfigLocationsMenu()
-    local contextOptions = {}
-    
-    for i, banditGroup in ipairs(Config.Bandits) do
-        local statusIcon = banditGroup.enabled ~= false and '[ON]' or '[OFF]'
-        local mountIcon = banditGroup.mounted ~= false and '[M]' or '[F]'
-        
-        table.insert(contextOptions, {
-            title = statusIcon .. ' ' .. mountIcon .. ' Config Location ' .. i,
-            description = 'X: ' .. math.floor(banditGroup.triggerPoint.x) .. ', Y: ' .. math.floor(banditGroup.triggerPoint.y) .. ', Z: ' .. math.floor(banditGroup.triggerPoint.z),
-            icon = 'fas fa-cog',
-            onSelect = function()
-                local input = lib.inputDialog('Spawn Bandits', {
-                    {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10, required = true},
-                    {type = 'select', label = 'Type', options = {
-                        {value = 'mounted', label = 'Mounted'},
-                        {value = 'foot', label = 'On Foot'},
-                        {value = 'mixed', label = 'Mixed'}
-                    }, default = 'mounted'}
-                })
-                
-                if input and input[1] then
-                    if input[2] == 'mixed' then
-                        local mounted = math.floor(input[1] / 2)
-                        local onFoot = input[1] - mounted
-                        spawnBanditsAtLocation(banditGroup.triggerPoint, mounted, 0, true)
-                        spawnBanditsAtLocation(banditGroup.triggerPoint, onFoot, 0, false)
-                    else
-                        local isMounted = input[2] == 'mounted'
-                        spawnBanditsAtLocation(banditGroup.triggerPoint, input[1], 0, isMounted)
-                    end
-                end
-            end
-        })
-    end
-    
-    lib.registerContext({
-        id = 'config_locations_menu',
-        title = 'Config Locations',
-        menu = 'bandit_admin_menu',
-        options = contextOptions
-    })
-    
-    lib.showContext('config_locations_menu')
-end
-
--- Proximity trigger system for saved locations - NOW USES SERVER CHECK
+-- Proximity trigger system for saved locations
 Citizen.CreateThread(function()
     while true do
         Wait(1000)
@@ -805,13 +1208,11 @@ Citizen.CreateThread(function()
                 local dis = GetDistanceBetweenCoords(playerCoords.x, playerCoords.y, playerCoords.z, location.coords.x, location.coords.y, location.coords.z)
                 
                 if dis < location.proximity then
-                    -- Only request if we haven't already requested this location
                     if not pendingProximityRequests[location.id] then
                         pendingProximityRequests[location.id] = true
                         TriggerServerEvent('rsg-bandits:server:requestProximityTrigger', location.id)
                     end
                 elseif dis >= location.proximity * 1.5 then
-                    -- Reset pending request when player leaves area
                     pendingProximityRequests[location.id] = nil
                     TriggerServerEvent('rsg-bandits:server:playerLeftProximity', location.id)
                 end
@@ -820,11 +1221,10 @@ Citizen.CreateThread(function()
     end
 end)
 
--- Server approved proximity spawn
+-- Server approved proximity spawn (updated for zombies)
 RegisterNetEvent('rsg-bandits:client:triggerProximityBandits', function(locationId, locationData)
     pendingProximityRequests[locationId] = nil
     
-    -- Find the local location data or use server-provided data
     local location = nil
     for _, loc in ipairs(tempBanditLocations) do
         if loc.id == locationId then
@@ -836,40 +1236,68 @@ RegisterNetEvent('rsg-bandits:client:triggerProximityBandits', function(location
     if not location and locationData then
         location = {
             coords = vector3(locationData.coords.x, locationData.coords.y, locationData.coords.z),
+            spawnType = locationData.spawnType or 'bandit',
             banditType = locationData.banditType or 'mounted',
             banditCount = locationData.banditCount or 3,
+            zombieCount = locationData.zombieCount or 0,
             timer = locationData.timer or 0
         }
     end
     
     if location then
-        if location.banditType == 'mixed' then
-            local mounted = math.floor(location.banditCount / 2)
-            local onFoot = location.banditCount - mounted
-            spawnBanditsAtLocation(location.coords, mounted, location.timer, true)
-            spawnBanditsAtLocation(location.coords, onFoot, location.timer, false)
+        -- Spawn based on type
+        if location.spawnType == 'zombie' then
+            if location.zombieCount > 0 then
+                spawnZombiesAtLocation(location.coords, location.zombieCount, location.timer)
+            end
+        elseif location.spawnType == 'both' then
+            -- Spawn both bandits and zombies
+            if location.banditCount > 0 then
+                if location.banditType == 'mixed' then
+                    local mounted = math.floor(location.banditCount / 2)
+                    local onFoot = location.banditCount - mounted
+                    spawnBanditsAtLocation(location.coords, mounted, location.timer, true)
+                    spawnBanditsAtLocation(location.coords, onFoot, location.timer, false)
+                else
+                    local isMounted = location.banditType == 'mounted'
+                    spawnBanditsAtLocation(location.coords, location.banditCount, location.timer, isMounted)
+                end
+            end
+            if location.zombieCount > 0 then
+                spawnZombiesAtLocation(location.coords, location.zombieCount, location.timer)
+            end
         else
-            local isMounted = location.banditType == 'mounted'
-            spawnBanditsAtLocation(location.coords, location.banditCount, location.timer, isMounted)
+            -- Default: bandits only
+            if location.banditCount > 0 then
+                if location.banditType == 'mixed' then
+                    local mounted = math.floor(location.banditCount / 2)
+                    local onFoot = location.banditCount - mounted
+                    spawnBanditsAtLocation(location.coords, mounted, location.timer, true)
+                    spawnBanditsAtLocation(location.coords, onFoot, location.timer, false)
+                else
+                    local isMounted = location.banditType == 'mounted'
+                    spawnBanditsAtLocation(location.coords, location.banditCount, location.timer, isMounted)
+                end
+            end
         end
     end
 end)
 
--- Server denied proximity trigger (cooldown or already triggered)
 RegisterNetEvent('rsg-bandits:client:proximityTriggerDenied', function(locationId, reason)
     pendingProximityRequests[locationId] = nil
 end)
 
--- Register commands
+-- Register commands (NO HARD LIMITS - uses config)
 RegisterCommand('banditmenu', function()
     openBanditMenu()
 end, false)
 
 RegisterCommand('spawnbandits', function(source, args)
+    local limits = getSpawnLimits()
     local count = tonumber(args[1]) or 3
     local banditType = args[2] or 'mounted'
     
-    if count > 10 then count = 10 end
+    if count > limits.banditsPerSpawn then count = limits.banditsPerSpawn end
     if count < 1 then count = 1 end
     
     local coords = GetEntityCoords(PlayerPedId())
@@ -886,12 +1314,38 @@ RegisterCommand('spawnbandits', function(source, args)
     end
 end, false)
 
+RegisterCommand('spawnzombies', function(source, args)
+    local limits = getSpawnLimits()
+    local count = tonumber(args[1]) or 5
+    
+    if count > limits.zombiesPerSpawn then count = limits.zombiesPerSpawn end
+    if count < 1 then count = 1 end
+    
+    local coords = GetEntityCoords(PlayerPedId())
+    spawnZombiesAtLocation(coords, count, 0)
+end, false)
+
 RegisterCommand('deletebandits', function()
     deleteAllAdminBandits()
 end, false)
 
+RegisterCommand('deletezombies', function()
+    deleteAllZombies()
+end, false)
+
+RegisterCommand('deleteall', function()
+    deleteAllSpawned()
+end, false)
+
 RegisterCommand('addlocation', function()
     addLocationViaMenu()
+end, false)
+
+-- Command to show current spawn counts
+RegisterCommand('spawncount', function()
+    local bandits, zombies = getSpawnCounts()
+    local limits = getSpawnLimits()
+    TriggerEvent('rNotify:NotifyLeft', "SPAWN COUNT", "Bandits: " .. bandits .. "/" .. limits.totalBandits .. " | Zombies: " .. zombies .. "/" .. limits.totalZombies, "generic_textures", "tick", 4000)
 end, false)
 
 -- Cooldown timer function
@@ -944,6 +1398,19 @@ AddEventHandler("onResourceStop", function(resourceName)
         end
     end
     
+    -- Cleanup zombies
+    for _, zombie in pairs(adminSpawnedZombies) do
+        if DoesEntityExist(zombie) then
+            DeleteEntity(zombie)
+        end
+    end
+    
+    for _, blip in pairs(adminZombieBlips) do
+        if DoesBlipExist(blip) then
+            RemoveBlip(blip)
+        end
+    end
+    
     for _, location in ipairs(tempBanditLocations) do
         if location.blip and DoesBlipExist(location.blip) then
             RemoveBlip(location.blip)
@@ -951,4 +1418,5 @@ AddEventHandler("onResourceStop", function(resourceName)
     end
     
     trackedBandits = {}
+    trackedZombies = {}
 end)

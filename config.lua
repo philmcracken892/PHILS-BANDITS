@@ -178,3 +178,105 @@ Config.BanditsModel = {
     "A_M_M_RANCHERTRAVELERS_COOL_01",
     "A_M_M_RANCHERTRAVELERS_WARM_01",
 }
+
+
+-------------------------------
+-- Zombie Settings
+-------------------------------
+Config.EnableZombies = true
+Config.ZombieRewards = true
+Config.ZombieRewardChance = 60 -- % chance to get reward from zombie kill
+
+Config.ZombieCashReward = {
+    enabled = true,
+    min = 1,
+    max = 5
+}
+
+Config.ZombieItemRewards = {
+    enabled = true,
+    minItems = 0,
+    maxItems = 2,
+    items = {
+        { item = 'herbs', chance = 30, min = 1, max = 2 },
+        { item = 'raw_meat', chance = 40, min = 1, max = 3 },
+        
+    }
+}
+
+-------------------------------
+-- Spawn Limits
+-------------------------------
+Config.SpawnLimits = {
+    banditsPerSpawn = 50,      -- Max bandits per single spawn
+    zombiesPerSpawn = 100,     -- Max zombies per single spawn
+    totalBandits = 100,        -- Max total bandits at once
+    totalZombies = 200,        -- Max total zombies at once
+    hordeSize = 50,            -- Max horde size
+}
+
+-- Zombie behavior settings
+Config.ZombieSettings = {
+    health = 100,                -- Zombie health (lower = easier to kill)
+    damage = 15,                 -- Damage per hit
+    speed = 1.0,                 -- Movement speed multiplier (1.0 = normal, 1.5 = fast)
+    aggroRange = 50.0,           -- Range at which zombies detect players
+    attackRange = 2.0,           -- Melee attack range
+    canRun = true,               -- Whether zombies can run
+    canSprint = false,           -- Whether zombies can sprint
+}
+
+-------------------------------
+-- Zombie Models
+-------------------------------
+Config.ZombieModels = {
+    { model = `CS_MrAdler`,                    outfit = 1},
+    { model = `CS_ODProstitute`,               outfit = 0},
+    { model = `CS_SwampFreak`,                 outfit = 0},
+    { model = `CS_Vampire`,                    outfit = 0},
+    { model = `CS_ChelonianMaster`,            outfit = 0},
+    { model = `RE_Voice_Females_01`,           outfit = 0},
+    { model = `RE_SavageAftermath_Males_01`,   outfit = 0},
+    { model = `RE_SavageAftermath_Males_01`,   outfit = 1},
+    { model = `RE_SavageAftermath_Males_01`,   outfit = 2},
+    { model = `RE_SavageWarning_Males_01`,     outfit = 3},
+    { model = `RE_SavageWarning_Males_01`,     outfit = 4},
+    { model = `RE_SavageWarning_Males_01`,     outfit = 5},
+    { model = `RE_SavageWarning_Males_01`,     outfit = 6},
+    { model = `RE_SavageAftermath_Males_01`,   outfit = 3},
+    { model = `RE_SavageAftermath_Males_01`,   outfit = 4},
+    { model = `RE_SavageAftermath_Females_01`, outfit = 0},
+    { model = `RE_SavageAftermath_Females_01`, outfit = 1},
+    { model = `RE_CorpseCart_Males_01`,        outfit = 0},
+    { model = `RE_CorpseCart_Males_01`,        outfit = 1},
+    { model = `RE_CorpseCart_Males_01`,        outfit = 2},
+    { model = `RE_LostFriend_Males_01`,        outfit = 0},
+    { model = `RE_LostFriend_Males_01`,        outfit = 1},
+    { model = `RE_LostFriend_Males_01`,        outfit = 2},
+    { model = `A_F_M_ArmCholeraCorpse_01`,     outfit = 0},
+    { model = `A_F_M_ArmCholeraCorpse_01`,     outfit = 1},
+    { model = `A_F_M_ArmCholeraCorpse_01`,     outfit = 2},
+    { model = `A_F_M_ArmCholeraCorpse_01`,     outfit = 3},
+    { model = `A_F_M_ArmCholeraCorpse_01`,     outfit = 4},
+    { model = `A_F_M_ArmCholeraCorpse_01`,     outfit = 5},
+    { model = `A_M_M_ArmCholeraCorpse_01`,     outfit = 0},
+    { model = `A_M_M_ArmCholeraCorpse_01`,     outfit = 1},
+    { model = `A_M_M_ArmCholeraCorpse_01`,     outfit = 2},
+    { model = `A_M_M_ArmCholeraCorpse_01`,     outfit = 3},
+    { model = `A_M_M_ArmCholeraCorpse_01`,     outfit = 4},
+    { model = `A_M_M_ArmCholeraCorpse_01`,     outfit = 5},
+    { model = `U_M_M_CircusWagon_01`,          outfit = 0},
+    { model = `A_M_M_UniCorpse_01`,            outfit = 0},
+    { model = `A_M_M_UniCorpse_01`,            outfit = 3},
+    { model = `A_M_M_UniCorpse_01`,            outfit = 4},
+    { model = `A_M_M_UniCorpse_01`,            outfit = 5},
+    { model = `A_M_M_UniCorpse_01`,            outfit = 8},
+    { model = `A_M_M_UniCorpse_01`,            outfit = 15},
+    { model = `A_M_M_UniCorpse_01`,            outfit = 16},
+    { model = `A_F_M_UniCorpse_01`,            outfit = 0},
+    { model = `A_F_M_UniCorpse_01`,            outfit = 1},
+    { model = `A_F_M_UniCorpse_01`,            outfit = 2},
+    { model = `A_F_M_UniCorpse_01`,            outfit = 4},
+    { model = `A_F_M_UniCorpse_01`,            outfit = 5},
+    { model = `U_M_M_APFDeadMan_01`,           outfit = 0}
+}
