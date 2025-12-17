@@ -1,7 +1,11 @@
 local RSGCore = exports['rsg-core']:GetCoreObject()
 
 local savedLocationsFile = "saved_locations.json"
+local serverSavedLocations = {}
 
+-- Server-side trigger tracking (prevents multiple players triggering same location)
+local triggeredConfigLocations = {}  -- Tracks config-based triggers
+local triggeredProximityLocations = {} -- Tracks proximity-based triggers
 
 function EnsureFileExists()
     local resourcePath = GetResourcePath(GetCurrentResourceName())
@@ -9,15 +13,12 @@ function EnsureFileExists()
     
     local file = io.open(filePath, "r")
     if not file then
-       
         file = io.open(filePath, "w")
         if file then
             file:write("[]")
             file:close()
-            
             return true
         else
-            
             return false
         end
     else
@@ -25,7 +26,6 @@ function EnsureFileExists()
         return true
     end
 end
-
 
 function LoadSavedLocations()
     local resourcePath = GetResourcePath(GetCurrentResourceName())
@@ -39,26 +39,20 @@ function LoadSavedLocations()
         if content and content ~= "" then
             local success, decoded = pcall(json.decode, content)
             if success and decoded then
-               
                 return decoded
             else
-                
-                
                 local backupFile = io.open(filePath .. ".backup", "w")
                 if backupFile then
                     backupFile:write(content)
                     backupFile:close()
-                    
                 end
                 return {}
             end
         end
     end
     
-    
     return {}
 end
-
 
 function SaveLocations(locations)
     local resourcePath = GetResourcePath(GetCurrentResourceName())
@@ -70,56 +64,39 @@ function SaveLocations(locations)
         if success then
             file:write(encoded)
             file:close()
-           
             return true
         else
             file:close()
-           
             return false
         end
     else
-        
         return false
     end
 end
 
-
 AddEventHandler('onResourceStart', function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
-    
-    
     EnsureFileExists()
-    
-   
     serverSavedLocations = LoadSavedLocations()
-    
-   
+    print("[rsg-bandits] Loaded " .. #serverSavedLocations .. " saved locations")
 end)
-
-
-local serverSavedLocations = {}
-
 
 EnsureFileExists()
 serverSavedLocations = LoadSavedLocations()
-
 
 RegisterNetEvent('rsg-bandits:server:getSavedLocations', function()
     local src = source
     TriggerClientEvent('rsg-bandits:client:loadSavedLocations', src, serverSavedLocations)
 end)
 
-
 RegisterNetEvent('rsg-bandits:server:saveLocation', function(locationData)
     local src = source
-    
     
     if not locationData or not locationData.name or not locationData.coords then
         TriggerClientEvent('rNotify:NotifyLeft', src, "ERROR", "Invalid location data", "generic_textures", "tick", 4000)
         return
     end
     
-   
     locationData.id = os.time() .. "_" .. math.random(1000, 9999)
     locationData.createdBy = GetPlayerName(src) or "Unknown"
     locationData.createdAt = os.time()
@@ -127,16 +104,13 @@ RegisterNetEvent('rsg-bandits:server:saveLocation', function(locationData)
     table.insert(serverSavedLocations, locationData)
     
     if SaveLocations(serverSavedLocations) then
-        
         TriggerClientEvent('rsg-bandits:client:loadSavedLocations', -1, serverSavedLocations)
         TriggerClientEvent('rNotify:NotifyLeft', src, "LOCATION SAVED", "'" .. locationData.name .. "' saved to server", "generic_textures", "tick", 4000)
     else
-        
         table.remove(serverSavedLocations, #serverSavedLocations)
         TriggerClientEvent('rNotify:NotifyLeft', src, "ERROR", "Failed to save location", "generic_textures", "tick", 4000)
     end
 end)
-
 
 RegisterNetEvent('rsg-bandits:server:deleteLocation', function(locationId)
     local src = source
@@ -148,8 +122,10 @@ RegisterNetEvent('rsg-bandits:server:deleteLocation', function(locationId)
             local locationName = location.name
             table.remove(serverSavedLocations, i)
             
+            -- Also remove from triggered tracking
+            triggeredProximityLocations[locationId] = nil
+            
             if SaveLocations(serverSavedLocations) then
-                
                 TriggerClientEvent('rsg-bandits:client:loadSavedLocations', -1, serverSavedLocations)
                 TriggerClientEvent('rNotify:NotifyLeft', src, "LOCATION DELETED", "'" .. locationName .. "' removed from server", "generic_textures", "tick", 4000)
             end
@@ -158,7 +134,6 @@ RegisterNetEvent('rsg-bandits:server:deleteLocation', function(locationId)
     end
 end)
 
-
 RegisterNetEvent('rsg-bandits:server:updateLocation', function(locationData)
     local src = source
     
@@ -166,7 +141,6 @@ RegisterNetEvent('rsg-bandits:server:updateLocation', function(locationData)
     
     for i, location in ipairs(serverSavedLocations) do
         if location.id == locationData.id then
-           
             locationData.createdBy = location.createdBy
             locationData.createdAt = location.createdAt
             locationData.updatedBy = GetPlayerName(src) or "Unknown"
@@ -175,7 +149,6 @@ RegisterNetEvent('rsg-bandits:server:updateLocation', function(locationData)
             serverSavedLocations[i] = locationData
             
             if SaveLocations(serverSavedLocations) then
-                -- Sync to all clients
                 TriggerClientEvent('rsg-bandits:client:loadSavedLocations', -1, serverSavedLocations)
                 TriggerClientEvent('rNotify:NotifyLeft', src, "LOCATION UPDATED", "'" .. locationData.name .. "' updated", "generic_textures", "tick", 4000)
             end
@@ -184,6 +157,111 @@ RegisterNetEvent('rsg-bandits:server:updateLocation', function(locationData)
     end
 end)
 
+-- ============================================
+-- CONFIG BANDIT TRIGGER SYSTEM (Server-Controlled)
+-- ============================================
+
+RegisterNetEvent('rsg-bandits:server:requestConfigTrigger', function(configIndex)
+    local src = source
+    local currentTime = os.time()
+    
+    -- Check if this config location is already triggered and on cooldown
+    if triggeredConfigLocations[configIndex] then
+        local triggerData = triggeredConfigLocations[configIndex]
+        local cooldown = Config.Cooldown or 300
+        
+        if currentTime - triggerData.triggeredAt < cooldown then
+            -- Still on cooldown, deny the request
+            TriggerClientEvent('rsg-bandits:client:configTriggerDenied', src, configIndex, "Location on cooldown")
+            return
+        end
+    end
+    
+    -- Mark as triggered
+    triggeredConfigLocations[configIndex] = {
+        triggeredAt = currentTime,
+        triggeredBy = src
+    }
+    
+    -- Approve the trigger for this player only
+    TriggerClientEvent('rsg-bandits:client:triggerConfigBandits', src, configIndex)
+    
+    print("[rsg-bandits] Config location " .. configIndex .. " triggered by player " .. src)
+end)
+
+-- ============================================
+-- PROXIMITY BANDIT TRIGGER SYSTEM (Server-Controlled)
+-- ============================================
+
+RegisterNetEvent('rsg-bandits:server:requestProximityTrigger', function(locationId)
+    local src = source
+    local currentTime = os.time()
+    
+    if not locationId then return end
+    
+    -- Find the location data
+    local locationData = nil
+    for _, loc in ipairs(serverSavedLocations) do
+        if loc.id == locationId then
+            locationData = loc
+            break
+        end
+    end
+    
+    if not locationData then
+        TriggerClientEvent('rsg-bandits:client:proximityTriggerDenied', src, locationId, "Location not found")
+        return
+    end
+    
+    -- Check if location is enabled
+    if locationData.enabled == false then
+        TriggerClientEvent('rsg-bandits:client:proximityTriggerDenied', src, locationId, "Location disabled")
+        return
+    end
+    
+    -- Check initial delay (for newly created locations)
+    if locationData.createdAt then
+        local initialDelay = locationData.initialDelay or 60
+        if currentTime - locationData.createdAt < initialDelay then
+            TriggerClientEvent('rsg-bandits:client:proximityTriggerDenied', src, locationId, "Initial delay active")
+            return
+        end
+    end
+    
+    -- Check if already triggered and on cooldown
+    if triggeredProximityLocations[locationId] then
+        local triggerData = triggeredProximityLocations[locationId]
+        local cooldown = locationData.cooldown or 300
+        
+        if currentTime - triggerData.triggeredAt < cooldown then
+            -- Still on cooldown, deny the request
+            TriggerClientEvent('rsg-bandits:client:proximityTriggerDenied', src, locationId, "Location on cooldown")
+            return
+        end
+    end
+    
+    -- Mark as triggered
+    triggeredProximityLocations[locationId] = {
+        triggeredAt = currentTime,
+        triggeredBy = src,
+        locationName = locationData.name
+    }
+    
+    -- Approve the trigger for this player only
+    TriggerClientEvent('rsg-bandits:client:triggerProximityBandits', src, locationId, locationData)
+    
+    print("[rsg-bandits] Proximity location '" .. locationData.name .. "' triggered by player " .. src)
+end)
+
+-- Handle player leaving proximity (optional - for future use)
+RegisterNetEvent('rsg-bandits:server:playerLeftProximity', function(locationId)
+    -- Could be used to track if all players have left an area
+    -- Currently not resetting trigger here - it resets on cooldown
+end)
+
+-- ============================================
+-- PLAYER EVENTS
+-- ============================================
 
 RegisterNetEvent('rsg-bandits:server:robplayer', function()
     local src = source
@@ -198,7 +276,6 @@ RegisterNetEvent('rsg-bandits:server:robplayer', function()
     end
 end)
 
-
 RegisterNetEvent('rsg-bandits:server:rewardPlayer', function()
     local src = source
     local Player = RSGCore.Functions.GetPlayer(src)
@@ -206,13 +283,11 @@ RegisterNetEvent('rsg-bandits:server:rewardPlayer', function()
     if not Player then return end
     if not Config.EnableRewards then return end
     
-    
     if math.random(1, 100) > Config.RewardChance then
         return
     end
     
     local rewardMessages = {}
-    
     
     if Config.CashReward.enabled then
         local cashAmount = math.random(Config.CashReward.min, Config.CashReward.max)
@@ -221,9 +296,6 @@ RegisterNetEvent('rsg-bandits:server:rewardPlayer', function()
             table.insert(rewardMessages, "$" .. cashAmount .. " cash")
         end
     end
-    
-    
-    
     
     if Config.ItemRewards.enabled then
         local numItems = math.random(Config.ItemRewards.minItems, Config.ItemRewards.maxItems)
@@ -259,19 +331,20 @@ RegisterNetEvent('rsg-bandits:server:rewardPlayer', function()
         end
     end
     
-   
     if #rewardMessages > 0 then
         local rewardText = table.concat(rewardMessages, ", ")
         TriggerClientEvent('rNotify:NotifyLeft', src, "BANDIT LOOT", rewardText, "generic_textures", "tick", 4000)
     end
 end)
 
+-- ============================================
+-- ADMIN COMMANDS
+-- ============================================
 
 RegisterCommand('toggleconfigbandits', function(source, args)
     if source > 0 then
         local Player = RSGCore.Functions.GetPlayer(source)
         if not Player then return end
-       
     end
     
     Config.EnableConfigBandits = not Config.EnableConfigBandits
@@ -285,3 +358,39 @@ RegisterCommand('toggleconfigbandits', function(source, args)
     end
 end, false)
 
+-- Admin command to reset all trigger cooldowns
+RegisterCommand('resetbandittriggers', function(source, args)
+    if source > 0 then
+        local Player = RSGCore.Functions.GetPlayer(source)
+        if not Player then return end
+        -- Add admin check here if needed
+    end
+    
+    triggeredConfigLocations = {}
+    triggeredProximityLocations = {}
+    
+    print("[rsg-bandits] All trigger cooldowns reset")
+    
+    if source > 0 then
+        TriggerClientEvent('rNotify:NotifyLeft', source, "TRIGGERS RESET", "All bandit trigger cooldowns have been reset", "generic_textures", "tick", 4000)
+    end
+end, false)
+
+-- Admin command to view trigger status
+RegisterCommand('bandittriggerstatus', function(source, args)
+    print("[rsg-bandits] === TRIGGER STATUS ===")
+    print("Config Locations Triggered: " .. tableLength(triggeredConfigLocations))
+    for k, v in pairs(triggeredConfigLocations) do
+        print("  - Config #" .. k .. " triggered by player " .. v.triggeredBy .. " at " .. os.date("%H:%M:%S", v.triggeredAt))
+    end
+    print("Proximity Locations Triggered: " .. tableLength(triggeredProximityLocations))
+    for k, v in pairs(triggeredProximityLocations) do
+        print("  - '" .. (v.locationName or k) .. "' triggered by player " .. v.triggeredBy .. " at " .. os.date("%H:%M:%S", v.triggeredAt))
+    end
+end, false)
+
+function tableLength(t)
+    local count = 0
+    for _ in pairs(t) do count = count + 1 end
+    return count
+end

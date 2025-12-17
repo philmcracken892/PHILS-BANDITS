@@ -15,20 +15,20 @@ local tempBanditLocations = {}
 local copiedCoords = nil
 local configBanditsEnabled = Config.EnableConfigBandits
 
+-- Track which locations we've already requested (to prevent spam)
+local pendingConfigRequests = {}
+local pendingProximityRequests = {}
 
 AddEventHandler('onResourceStart', function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
     TriggerServerEvent('rsg-bandits:server:getSavedLocations')
 end)
 
-
 RegisterNetEvent('RSGCore:Client:OnPlayerLoaded', function()
     TriggerServerEvent('rsg-bandits:server:getSavedLocations')
 end)
 
-
 RegisterNetEvent('rsg-bandits:client:loadSavedLocations', function(locations)
-    
     for _, location in ipairs(tempBanditLocations) do
         if location.blip and DoesBlipExist(location.blip) then
             RemoveBlip(location.blip)
@@ -36,7 +36,6 @@ RegisterNetEvent('rsg-bandits:client:loadSavedLocations', function(locations)
     end
     
     tempBanditLocations = {}
-    
     
     for _, loc in ipairs(locations) do
         table.insert(tempBanditLocations, {
@@ -71,19 +70,27 @@ RegisterNetEvent('rsg-bandits:client:updateConfigBandits', function(enabled)
     end
 end)
 
--- Config bandits trigger loop
+-- Config bandits trigger loop - NOW USES SERVER CHECK
 Citizen.CreateThread(function()
     while true do
         Wait(1000)
         if configBanditsEnabled and Config.EnableConfigBandits then
             for v, k in pairs(Config.Bandits) do
-                -- Check if this specific location is enabled
                 if k.enabled ~= false then
                     local coords = GetEntityCoords(PlayerPedId())
                     local dis = GetDistanceBetweenCoords(coords.x, coords.y, coords.z, k.triggerPoint.x, k.triggerPoint.y, k.triggerPoint.z)
+                    
                     if dis < Config.TriggerBandits and spawnbandits == false then
-                        banditsTrigger(k.bandits, k.mounted)
+                        -- Only request if we haven't already requested this location
+                        if not pendingConfigRequests[v] then
+                            pendingConfigRequests[v] = true
+                            TriggerServerEvent('rsg-bandits:server:requestConfigTrigger', v)
+                        end
+                    else
+                        -- Reset pending request when player leaves trigger area
+                        pendingConfigRequests[v] = nil
                     end
+                    
                     if dis >= Config.CalloffBandits and spawnbandits == true then
                         calloffbandits = true
                     end
@@ -93,9 +100,24 @@ Citizen.CreateThread(function()
     end
 end)
 
+-- Server approved config bandit spawn
+RegisterNetEvent('rsg-bandits:client:triggerConfigBandits', function(configIndex)
+    local k = Config.Bandits[configIndex]
+    if k and spawnbandits == false then
+        banditsTrigger(k.bandits, k.mounted)
+    end
+    pendingConfigRequests[configIndex] = nil
+end)
+
+-- Server denied config trigger (cooldown)
+RegisterNetEvent('rsg-bandits:client:configTriggerDenied', function(configIndex, reason)
+    pendingConfigRequests[configIndex] = nil
+    -- Optionally show message
+    -- TriggerEvent('rNotify:NotifyLeft', "BANDITS", reason or "Area already active", "generic_textures", "tick", 4000)
+end)
+
 function banditsTrigger(bandits, mounted)
     spawnbandits = true
-    -- Default to mounted if not specified
     if mounted == nil then mounted = true end
     
     for v, k in pairs(bandits) do
@@ -107,29 +129,24 @@ function banditsTrigger(bandits, mounted)
         while not HasModelLoaded(banditmodel) do Wait(1) end
         Citizen.Wait(100)
         
-        -- Create bandits
         npcs[v] = CreatePed(banditmodel, k, true, true, true, true)
         Citizen.InvokeNative(0x283978A15512B2FE, npcs[v], true)
         Citizen.InvokeNative(0x23f74c2fda6e7c61, 953018525, npcs[v])
         
-        -- Give weapon to bandits
         GiveWeaponToPed(npcs[v], banditWeapon, 50, true, true, 1, false, 0.5, 1.0, 1.0, true, 0, 0)
         SetCurrentPedWeapon(npcs[v], banditWeapon, true)
         
-        -- Track bandit for death detection
         trackedBandits[npcs[v]] = {
             isDead = false,
             type = "config"
         }
         
-        -- Create blip for bandit
         local banditCoords = GetEntityCoords(npcs[v])
         local banditBlip = Citizen.InvokeNative(0x554D9D53F696D002, 1664425300, banditCoords.x, banditCoords.y, banditCoords.z)
         Citizen.InvokeNative(0x9CB1A1623062F402, banditBlip, mounted and "Mounted Bandit" or "Bandit")
         Citizen.InvokeNative(0x662D364ABF16DE2F, banditBlip, 0x59FA676C)
         banditBlips[v] = banditBlip
         
-        -- Only spawn horse if mounted is true
         if mounted then
             local horsemodel = GetHashKey(Config.HorseModels[math.random(1, #Config.HorseModels)])
             
@@ -140,11 +157,11 @@ function banditsTrigger(bandits, mounted)
             
             horse[v] = CreatePed(horsemodel, k, true, true, true, true)
             Citizen.InvokeNative(0x283978A15512B2FE, horse[v], true)
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0x20359E53, true, true, true) -- saddle
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0x508B80B9, true, true, true) -- blanket
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0xF0C30271, true, true, true) -- bag
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0x12F0DF9F, true, true, true) -- bedroll
-            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0x67AF7302, true, true, true) -- stirups
+            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0x20359E53, true, true, true)
+            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0x508B80B9, true, true, true)
+            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0xF0C30271, true, true, true)
+            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0x12F0DF9F, true, true, true)
+            Citizen.InvokeNative(0xD3A7B003ED343FD9, horse[v], 0x67AF7302, true, true, true)
             Citizen.InvokeNative(0x028F76B6E78246EB, npcs[v], horse[v], -1)
         end
         
@@ -161,7 +178,6 @@ Citizen.CreateThread(function()
                 if IsPedDeadOrDying(banditPed, true) and not data.isDead then
                     trackedBandits[banditPed].isDead = true
                     
-                    -- Check if player killed the bandit
                     local playerPed = PlayerPedId()
                     local killerPed = GetPedSourceOfDeath(banditPed)
                     
@@ -227,7 +243,6 @@ end)
 function spawnBanditsAtLocation(coords, count, timer, mounted)
     if not coords or count <= 0 then return end
     
-    -- Default to mounted if not specified
     if mounted == nil then mounted = true end
     
     if timer and timer > 0 then
@@ -263,19 +278,16 @@ function spawnBanditsAtLocation(coords, count, timer, mounted)
         GiveWeaponToPed(bandit, banditWeapon, 50, true, true, 1, false, 0.5, 1.0, 1.0, true, 0, 0)
         SetCurrentPedWeapon(bandit, banditWeapon, true)
         
-        -- Track bandit for death detection
         trackedBandits[bandit] = {
             isDead = false,
             type = "admin"
         }
         
-        -- Create blip for admin spawned bandit
         local banditBlip = Citizen.InvokeNative(0x554D9D53F696D002, 0x84AD0C5B, GetEntityCoords(bandit))
         SetBlipSprite(banditBlip, 0x84AD0C5B)
         Citizen.InvokeNative(0x9CB1A1623062F402, banditBlip, mounted and "Mounted Bandit" or "Bandit on Foot")
         adminBanditBlips[#adminBanditBlips + 1] = banditBlip
         
-        -- Only spawn horse if mounted is true
         if mounted then
             local horsemodel = GetHashKey(Config.HorseModels[math.random(1, #Config.HorseModels)])
             
@@ -353,9 +365,9 @@ function addLocationViaMenu()
             local input = lib.inputDialog('Add New Location', {
                 {type = 'input', label = 'Location Name', placeholder = 'Enter a name for this location', required = true},
                 {type = 'select', label = 'Bandit Type', options = {
-                    {value = 'mounted', label = '?? Mounted'},
-                    {value = 'foot', label = '?? On Foot'},
-                    {value = 'mixed', label = '?? Mixed (50/50)'}
+                    {value = 'mounted', label = 'Mounted'},
+                    {value = 'foot', label = 'On Foot'},
+                    {value = 'mixed', label = 'Mixed (50/50)'}
                 }, default = 'mounted'},
                 {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10},
                 {type = 'number', label = 'Spawn Delay (seconds)', description = 'Delay before bandits spawn (0 for immediate)', default = 0, min = 0},
@@ -418,9 +430,9 @@ function addLocationViaMenu()
                     {type = 'number', label = 'Z Coordinate', default = copiedCoords.z, required = true},
                     {type = 'number', label = 'Heading', default = copiedCoords.heading, required = true},
                     {type = 'select', label = 'Bandit Type', options = {
-                        {value = 'mounted', label = '?? Mounted'},
-                        {value = 'foot', label = '?? On Foot'},
-                        {value = 'mixed', label = '?? Mixed (50/50)'}
+                        {value = 'mounted', label = 'Mounted'},
+                        {value = 'foot', label = 'On Foot'},
+                        {value = 'mixed', label = 'Mixed (50/50)'}
                     }, default = 'mounted'},
                     {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10},
                     {type = 'number', label = 'Spawn Delay (seconds)', description = 'Delay before bandits spawn (0 for immediate)', default = 0, min = 0},
@@ -463,9 +475,9 @@ function addLocationViaMenu()
                 {type = 'number', label = 'Z Coordinate', placeholder = 'Current: ' .. string.format("%.2f", coords.z), required = true},
                 {type = 'number', label = 'Heading', placeholder = 'Current: ' .. string.format("%.2f", heading), default = heading},
                 {type = 'select', label = 'Bandit Type', options = {
-                    {value = 'mounted', label = '?? Mounted'},
-                    {value = 'foot', label = '?? On Foot'},
-                    {value = 'mixed', label = '?? Mixed (50/50)'}
+                    {value = 'mounted', label = 'Mounted'},
+                    {value = 'foot', label = 'On Foot'},
+                    {value = 'mixed', label = 'Mixed (50/50)'}
                 }, default = 'mounted'},
                 {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10},
                 {type = 'number', label = 'Spawn Delay (seconds)', description = 'Delay before bandits spawn (0 for immediate)', default = 0, min = 0},
@@ -506,7 +518,7 @@ function openBanditMenu()
     local contextOptions = {}
     
     table.insert(contextOptions, {
-        title = ' Spawn Mounted Bandits',
+        title = 'Spawn Mounted Bandits',
         description = 'Spawn bandits on horses at your location',
         icon = 'fas fa-horse',
         onSelect = function()
@@ -522,7 +534,7 @@ function openBanditMenu()
     })
     
     table.insert(contextOptions, {
-        title = ' Spawn Bandits on Foot',
+        title = 'Spawn Bandits on Foot',
         description = 'Spawn bandits without horses at your location',
         icon = 'fas fa-walking',
         onSelect = function()
@@ -538,7 +550,7 @@ function openBanditMenu()
     })
     
     table.insert(contextOptions, {
-        title = ' Spawn Mixed Bandits',
+        title = 'Spawn Mixed Bandits',
         description = 'Spawn a mix of mounted and on-foot bandits',
         icon = 'fas fa-dice',
         onSelect = function()
@@ -554,12 +566,10 @@ function openBanditMenu()
                 local mounted = math.floor(total * percentMounted)
                 local onFoot = total - mounted
                 
-                -- Spawn mounted bandits
                 if mounted > 0 then
                     spawnBanditsAtLocation(coords, mounted, 0, true)
                 end
                 
-                -- Spawn on-foot bandits
                 if onFoot > 0 then
                     spawnBanditsAtLocation(coords, onFoot, 0, false)
                 end
@@ -596,10 +606,6 @@ function openBanditMenu()
         })
     end
     
-    
-    
-    
-    
     lib.registerContext({
         id = 'bandit_admin_menu',
         title = 'Bandit Admin Menu',
@@ -613,14 +619,14 @@ function openSavedLocationsMenu()
     local contextOptions = {}
     
     for i, location in ipairs(tempBanditLocations) do
-        local statusIcon = location.enabled and '??' or '??'
+        local statusIcon = location.enabled and '[ON]' or '[OFF]'
         local banditIcon = ''
         if location.banditType == 'mounted' then
-            banditIcon = '??'
+            banditIcon = '[M]'
         elseif location.banditType == 'foot' then
-            banditIcon = '??'
+            banditIcon = '[F]'
         else
-            banditIcon = '??'
+            banditIcon = '[X]'
         end
         
         table.insert(contextOptions, {
@@ -646,7 +652,7 @@ end
 function openLocationActionsMenu(index, location)
     local contextOptions = {}
     
-    local typeIcon = location.banditType == 'mounted' and '??' or location.banditType == 'foot' and '??' or '??'
+    local typeIcon = location.banditType == 'mounted' and '[M]' or location.banditType == 'foot' and '[F]' or '[X]'
     
     table.insert(contextOptions, {
         title = 'Spawn Bandits Here',
@@ -657,9 +663,9 @@ function openLocationActionsMenu(index, location)
                 {type = 'number', label = 'Number of Bandits', default = location.banditCount or 3, min = 1, max = 10, required = true},
                 {type = 'select', label = 'Override Type', options = {
                     {value = 'default', label = 'Use Saved Setting (' .. location.banditType .. ')'},
-                    {value = 'mounted', label = '?? Force Mounted'},
-                    {value = 'foot', label = '?? Force On Foot'},
-                    {value = 'mixed', label = '?? Force Mixed'}
+                    {value = 'mounted', label = 'Force Mounted'},
+                    {value = 'foot', label = 'Force On Foot'},
+                    {value = 'mixed', label = 'Force Mixed'}
                 }, default = 'default'}
             })
             
@@ -746,8 +752,8 @@ function openConfigLocationsMenu()
     local contextOptions = {}
     
     for i, banditGroup in ipairs(Config.Bandits) do
-        local statusIcon = banditGroup.enabled ~= false and '??' or '??'
-        local mountIcon = banditGroup.mounted ~= false and '??' or '??'
+        local statusIcon = banditGroup.enabled ~= false and '[ON]' or '[OFF]'
+        local mountIcon = banditGroup.mounted ~= false and '[M]' or '[F]'
         
         table.insert(contextOptions, {
             title = statusIcon .. ' ' .. mountIcon .. ' Config Location ' .. i,
@@ -757,9 +763,9 @@ function openConfigLocationsMenu()
                 local input = lib.inputDialog('Spawn Bandits', {
                     {type = 'number', label = 'Number of Bandits', default = 3, min = 1, max = 10, required = true},
                     {type = 'select', label = 'Type', options = {
-                        {value = 'mounted', label = '?? Mounted'},
-                        {value = 'foot', label = '?? On Foot'},
-                        {value = 'mixed', label = '?? Mixed'}
+                        {value = 'mounted', label = 'Mounted'},
+                        {value = 'foot', label = 'On Foot'},
+                        {value = 'mixed', label = 'Mixed'}
                     }, default = 'mounted'}
                 })
                 
@@ -788,43 +794,70 @@ function openConfigLocationsMenu()
     lib.showContext('config_locations_menu')
 end
 
--- Proximity trigger system for saved locations
+-- Proximity trigger system for saved locations - NOW USES SERVER CHECK
 Citizen.CreateThread(function()
     while true do
         Wait(1000)
         local playerCoords = GetEntityCoords(PlayerPedId())
-        local currentTime = GetGameTimer()
         
         for _, location in ipairs(tempBanditLocations) do
-            if location.enabled and location.proximity > 0 and not location.isTriggered then
-                if currentTime - (location.createdAt or 0) >= (location.initialDelay * 1000) then
-                    if not location.lastTriggered or (currentTime - location.lastTriggered >= (location.cooldown * 1000)) then
-                        local dis = GetDistanceBetweenCoords(playerCoords.x, playerCoords.y, playerCoords.z, location.coords.x, location.coords.y, location.coords.z)
-                        if dis < location.proximity then
-                            location.isTriggered = true
-                            location.lastTriggered = currentTime
-                            
-                            -- Spawn based on saved bandit type
-                            if location.banditType == 'mixed' then
-                                local mounted = math.floor(location.banditCount / 2)
-                                local onFoot = location.banditCount - mounted
-                                spawnBanditsAtLocation(location.coords, mounted, location.timer, true)
-                                spawnBanditsAtLocation(location.coords, onFoot, location.timer, false)
-                            else
-                                local isMounted = location.banditType == 'mounted'
-                                spawnBanditsAtLocation(location.coords, location.banditCount, location.timer, isMounted)
-                            end
-                        end
-                    end
-                end
-            elseif location.isTriggered then
+            if location.enabled and location.proximity > 0 then
                 local dis = GetDistanceBetweenCoords(playerCoords.x, playerCoords.y, playerCoords.z, location.coords.x, location.coords.y, location.coords.z)
-                if dis >= location.proximity * 1.5 then
-                    location.isTriggered = false
+                
+                if dis < location.proximity then
+                    -- Only request if we haven't already requested this location
+                    if not pendingProximityRequests[location.id] then
+                        pendingProximityRequests[location.id] = true
+                        TriggerServerEvent('rsg-bandits:server:requestProximityTrigger', location.id)
+                    end
+                elseif dis >= location.proximity * 1.5 then
+                    -- Reset pending request when player leaves area
+                    pendingProximityRequests[location.id] = nil
+                    TriggerServerEvent('rsg-bandits:server:playerLeftProximity', location.id)
                 end
             end
         end
     end
+end)
+
+-- Server approved proximity spawn
+RegisterNetEvent('rsg-bandits:client:triggerProximityBandits', function(locationId, locationData)
+    pendingProximityRequests[locationId] = nil
+    
+    -- Find the local location data or use server-provided data
+    local location = nil
+    for _, loc in ipairs(tempBanditLocations) do
+        if loc.id == locationId then
+            location = loc
+            break
+        end
+    end
+    
+    if not location and locationData then
+        location = {
+            coords = vector3(locationData.coords.x, locationData.coords.y, locationData.coords.z),
+            banditType = locationData.banditType or 'mounted',
+            banditCount = locationData.banditCount or 3,
+            timer = locationData.timer or 0
+        }
+    end
+    
+    if location then
+        if location.banditType == 'mixed' then
+            local mounted = math.floor(location.banditCount / 2)
+            local onFoot = location.banditCount - mounted
+            spawnBanditsAtLocation(location.coords, mounted, location.timer, true)
+            spawnBanditsAtLocation(location.coords, onFoot, location.timer, false)
+        else
+            local isMounted = location.banditType == 'mounted'
+            spawnBanditsAtLocation(location.coords, location.banditCount, location.timer, isMounted)
+        end
+    end
+end)
+
+-- Server denied proximity trigger (cooldown or already triggered)
+RegisterNetEvent('rsg-bandits:client:proximityTriggerDenied', function(locationId, reason)
+    pendingProximityRequests[locationId] = nil
 end)
 
 -- Register commands
@@ -834,7 +867,7 @@ end, false)
 
 RegisterCommand('spawnbandits', function(source, args)
     local count = tonumber(args[1]) or 3
-    local banditType = args[2] or 'mounted' -- mounted, foot, or mixed
+    local banditType = args[2] or 'mounted'
     
     if count > 10 then count = 10 end
     if count < 1 then count = 1 end
@@ -877,7 +910,6 @@ end
 AddEventHandler("onResourceStop", function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
     
-    -- Clean up regular bandits
     for v, k in pairs(npcs) do
         if DoesEntityExist(k) then
             DeleteEntity(k)
@@ -889,14 +921,12 @@ AddEventHandler("onResourceStop", function(resourceName)
         end
     end
     
-    -- Clean up regular bandit blips
     for v, k in pairs(banditBlips) do
         if DoesBlipExist(k) then
             RemoveBlip(k)
         end
     end
     
-    -- Clean up admin bandits
     for _, bandit in pairs(adminSpawnedBandits) do
         if DoesEntityExist(bandit) then
             DeleteEntity(bandit)
@@ -908,20 +938,17 @@ AddEventHandler("onResourceStop", function(resourceName)
         end
     end
     
-    -- Clean up admin bandit blips
     for _, blip in pairs(adminBanditBlips) do
         if DoesBlipExist(blip) then
             RemoveBlip(blip)
         end
     end
     
-    -- Clean up location blips
     for _, location in ipairs(tempBanditLocations) do
         if location.blip and DoesBlipExist(location.blip) then
             RemoveBlip(location.blip)
         end
     end
     
-    -- Clear tracked bandits
     trackedBandits = {}
 end)
